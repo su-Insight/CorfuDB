@@ -55,11 +55,6 @@ jobs:
       - name: run tests
         run: ./mvnw -pl :coverage -am clean verify -Dmaven.test.failure.ignore=true -Dcode-coverage=true -Dmaven.javadoc.skip=true -Dcheckstyle.skip -T 1C
 
-      - name: Run codacy-coverage-reporter
-        uses: codacy/codacy-coverage-reporter-action@v1
-        with:
-          project-token: ${{ secrets.CODACY_PROJECT_TOKEN }}
-          coverage-reports: coverage/target/site/jacoco-aggregate/jacoco.xml
 
       - name: Upload Codecov report
         uses: codecov/codecov-action@v3
