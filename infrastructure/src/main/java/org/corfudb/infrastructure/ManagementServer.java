@@ -4,18 +4,11 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.protobuf.TextFormat;
 import io.netty.channel.ChannelHandlerContext;
-import javax.annotation.Nonnull;
-import java.lang.invoke.MethodHandles;
-import java.time.Duration;
-import java.util.List;
-import java.util.Set;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.atomic.AtomicReference;
-import java.util.concurrent.locks.Lock;
-import java.util.concurrent.locks.ReentrantLock;
-import java.util.stream.Collectors;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
+import org.corfudb.infrastructure.health.Component;
+import org.corfudb.infrastructure.health.HealthMonitor;
+import org.corfudb.infrastructure.health.Issue;
 import org.corfudb.infrastructure.management.ClusterStateContext;
 import org.corfudb.infrastructure.management.FailureDetector;
 import org.corfudb.infrastructure.management.ReconfigurationEventHandler;
@@ -35,6 +28,17 @@ import org.corfudb.runtime.proto.service.Management.ReportFailureRequestMsg;
 import org.corfudb.runtime.view.IReconfigurationHandlerPolicy;
 import org.corfudb.runtime.view.Layout;
 import org.corfudb.util.concurrent.SingletonResource;
+
+import javax.annotation.Nonnull;
+import java.lang.invoke.MethodHandles;
+import java.time.Duration;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.stream.Collectors;
 
 import static org.corfudb.protocols.CorfuProtocolCommon.getLayout;
 import static org.corfudb.protocols.CorfuProtocolServerErrors.getBootstrappedErrorMsg;
@@ -151,6 +155,7 @@ public class ManagementServer extends AbstractServer {
 
         clusterContext = serverInitializer.buildDefaultClusterContext(serverContext);
         managementAgent = serverInitializer.buildManagementAgent(corfuRuntime, serverContext, clusterContext);
+        HealthMonitor.reportIssue(Issue.createInitIssue(Component.ORCHESTRATOR));
         orchestrator = serverInitializer.buildOrchestrator(corfuRuntime, serverContext);
     }
 
@@ -196,8 +201,8 @@ public class ManagementServer extends AbstractServer {
     public synchronized void handleOrchestratorMsg(@Nonnull RequestMsg req,
                                                    @Nonnull ChannelHandlerContext ctx,
                                                    @Nonnull IServerRouter r) {
-        log.debug("handleOrchestratorMsg: {}",
-                TextFormat.shortDebugString(req.getPayload().getOrchestratorRequest()));
+        String orchestratorMsg = TextFormat.shortDebugString(req.getPayload().getOrchestratorRequest());
+        log.debug("handleOrchestratorMsg: {}", orchestratorMsg);
         orchestrator.handle(req, ctx, r);
     }
 
@@ -495,7 +500,7 @@ public class ManagementServer extends AbstractServer {
                                              @Nonnull ServerContext serverContext,
                                              @Nonnull ClusterStateContext clusterContext) {
             return new ManagementAgent(corfuRuntime, serverContext, clusterContext,
-                    new FailureDetector(serverContext.getLocalEndpoint()), serverContext.getManagementLayout());
+                    new FailureDetector(serverContext), serverContext.getManagementLayout());
         }
     }
 }

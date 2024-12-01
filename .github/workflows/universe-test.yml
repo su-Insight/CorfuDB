@@ -1,37 +1,51 @@
-on: pull_request
 name: Universe Test
+
+on: pull_request
+
+# Cancel Previous Runs
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   universe_test:
     # https://docs.github.com/en/free-pro-team@latest/actions/reference/workflow-syntax-for-github-actions#jobsjob_idruns-on
-    runs-on: ubuntu-18.04
+    runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
 
-      - name: Cancel Previous Runs
-        uses: styfle/cancel-workflow-action@0.6.0
+      - name: Set up JDK 11
+        uses: actions/setup-java@v4
         with:
-          access_token: ${{ github.token }}
+          distribution: 'corretto'
+          java-version: '11'
+          check-latest: true
+          cache-dependency-path: '**/pom.xml'
 
       - name: Cache local Maven repository
-        uses: actions/cache@v2
+        uses: actions/cache@v3
         with:
-          path: ~/.m2/repository
+          path: |
+            ~/.m2/repository
+            ~/.m2/wrapper/
           key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
           restore-keys: |
             ${{ runner.os }}-maven-
 
-      - name: Set up JDK 1.8
-        uses: actions/setup-java@v1
-        with:
-          java-version: 1.8
-
-      - uses: satackey/action-docker-layer-caching@v0.0.11
-        continue-on-error: true
+      - name: Install Docker
+        run: |
+          for pkg in docker.io docker-ce docker-ce-cli docker-ce-rootless-extras docker-doc docker-compose docker-compose-v2 podman-docker containerd runc; do sudo apt-get remove $pkg; done
+          curl -fsSL https://get.docker.com -o get-docker.sh
+          sudo sh ./get-docker.sh --version 24.0.9
+          /usr/bin/docker version
+          /usr/bin/docker info
 
       - name: Prepare Corfu
-        run: ./mvnw clean install -Pdocker -DskipTests -Dmaven.javadoc.skip=true -Dcheckstyle.skip -T 1C
+        run: .ci/infrastructure-docker-build.sh docker
+        shell: bash
 
       - name: Run universe tests
-        run: ./mvnw -pl :universe verify -Puniverse -Dmaven.javadoc.skip=true
+        run: |
+          ./mvnw -Dmaven.javadoc.skip=true -DskipTests -T 1C clean install
+          ./mvnw -pl :universe -Puniverse -Dmaven.javadoc.skip=true verify

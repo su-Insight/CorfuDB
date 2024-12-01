@@ -4,6 +4,9 @@ import lombok.AccessLevel;
 import lombok.Getter;
 import lombok.NonNull;
 import lombok.extern.slf4j.Slf4j;
+import org.corfudb.infrastructure.health.Component;
+import org.corfudb.infrastructure.health.HealthMonitor;
+import org.corfudb.infrastructure.health.Issue;
 import org.corfudb.infrastructure.management.ClusterStateContext;
 import org.corfudb.infrastructure.management.FailureDetector;
 import org.corfudb.runtime.CorfuRuntime;
@@ -44,17 +47,27 @@ public class ManagementAgent {
     /**
      * Locally collected server metrics polling interval.
      */
-    private static final Duration METRICS_POLL_INTERVAL = Duration.ofSeconds(3);
+    private static final Duration METRICS_POLL_INTERVAL = Duration.ofMillis(500);
 
     /**
      * Interval in executing the failure detection policy.
      */
-    private static final Duration POLICY_EXECUTE_INTERVAL = Duration.ofSeconds(1);
+    private static final Duration POLICY_EXECUTE_INTERVAL = Duration.ofMillis(500);
 
     /**
      * Interval of executing the AutoCommitService.
      */
     private static final Duration AUTO_COMMIT_INTERVAL = Duration.ofSeconds(15);
+
+    /**
+     * Interval of executing the CompactionService.
+     */
+    private static final Duration TRIGGER_INTERVAL = Duration.ofSeconds(10);
+
+    /**
+     * Compactor flag
+     */
+    private static final String COMPACTOR_SCRIPT_PATH_KEY = "--compactor-script";
 
     /**
      * To dispatch initialization tasks for recovery and sequencer bootstrap.
@@ -87,6 +100,12 @@ public class ManagementAgent {
     private final AutoCommitService autoCommitService;
 
     /**
+     * CompactorService to periodically orchestrate distributed compaction.
+     */
+    @Getter
+    private final CompactorService compactorService;
+
+    /**
      * Checks and restores if a layout is present in the local datastore to recover from.
      * Spawns an initialization task which recovers if required, and start monitoring services.
      *
@@ -115,6 +134,8 @@ public class ManagementAgent {
         // Else in every other case, the layout server is active and will contain the latest layout
         // (In case of trailing layout server, the management server's persisted layout helps.)
         serverContext.installSingleNodeLayoutIfAbsent();
+        log.debug("ManagementAgent(): serverContext.getCurrentLayout() {}, managementLayout {}",
+                serverContext.getCurrentLayout(), managementLayout);
         serverContext.saveManagementLayout(serverContext.getCurrentLayout());
         serverContext.saveManagementLayout(managementLayout);
 
@@ -125,8 +146,17 @@ public class ManagementAgent {
                 failureDetector,
                 localMonitoringService
         );
+        HealthMonitor.reportIssue(Issue.createInitIssue(Component.FAILURE_DETECTOR));
 
         this.autoCommitService = new AutoCommitService(serverContext, runtimeSingletonResource);
+
+        final String compactorScript = COMPACTOR_SCRIPT_PATH_KEY;
+        if (serverContext.getServerConfig(String.class, compactorScript) != null) {
+            HealthMonitor.reportIssue(Issue.createInitIssue(Component.COMPACTOR));
+        }
+
+        this.compactorService = new CompactorService(serverContext, TRIGGER_INTERVAL,
+                new InvokeCheckpointingJvm(serverContext), new DynamicTriggerPolicy());
 
         // Creating the initialization task thread.
         // This thread pool is utilized to dispatch one time recovery and sequencer bootstrap tasks.
@@ -175,7 +205,6 @@ public class ManagementAgent {
      */
     private void initializationTask() {
         log.info("Start initialization task");
-
         // Wait for management server to be bootstrapped.
         try {
             while (!shutdown && serverContext.getManagementLayout() == null) {
@@ -208,6 +237,11 @@ public class ManagementAgent {
             } else {
                 log.info("Auto commit service disabled.");
             }
+            if (serverContext.getServerConfig(String.class, COMPACTOR_SCRIPT_PATH_KEY) != null) {
+                compactorService.start(TRIGGER_INTERVAL);
+            } else {
+                log.info("Compaction Service disabled");
+            }
         }
     }
 
@@ -238,6 +272,7 @@ public class ManagementAgent {
         remoteMonitoringService.shutdown();
         localMonitoringService.shutdown();
         autoCommitService.shutdown();
+        compactorService.shutdown();
 
         log.info("Management Agent shutting down.");
     }

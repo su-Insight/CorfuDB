@@ -1,12 +1,13 @@
 package org.corfudb.protocols.wireprotocol;
 
-import static org.corfudb.protocols.wireprotocol.IMetadata.LogUnitMetadataType.CHECKPOINTED_STREAM_ID;
-import static org.corfudb.protocols.wireprotocol.IMetadata.LogUnitMetadataType.CHECKPOINTED_STREAM_START_LOG_ADDRESS;
-import static org.corfudb.protocols.wireprotocol.IMetadata.LogUnitMetadataType.CHECKPOINT_ID;
-import static org.corfudb.protocols.wireprotocol.IMetadata.LogUnitMetadataType.CHECKPOINT_TYPE;
-
-
 import com.google.common.reflect.TypeToken;
+import lombok.Getter;
+import org.corfudb.common.compression.Codec;
+import org.corfudb.protocols.logprotocol.CheckpointEntry;
+import org.corfudb.runtime.view.Address;
+import org.corfudb.runtime.view.Layout;
+
+import javax.annotation.Nullable;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.EnumMap;
@@ -16,12 +17,11 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.function.Function;
 import java.util.stream.Collectors;
-import javax.annotation.Nullable;
-import lombok.Getter;
-import org.corfudb.common.compression.Codec;
-import org.corfudb.protocols.logprotocol.CheckpointEntry;
-import org.corfudb.runtime.view.Address;
-import org.corfudb.runtime.view.Layout;
+
+import static org.corfudb.protocols.wireprotocol.IMetadata.LogUnitMetadataType.CHECKPOINTED_STREAM_ID;
+import static org.corfudb.protocols.wireprotocol.IMetadata.LogUnitMetadataType.CHECKPOINTED_STREAM_START_LOG_ADDRESS;
+import static org.corfudb.protocols.wireprotocol.IMetadata.LogUnitMetadataType.CHECKPOINT_ID;
+import static org.corfudb.protocols.wireprotocol.IMetadata.LogUnitMetadataType.CHECKPOINT_TYPE;
 
 /**
  * Created by mwei on 9/18/15.
@@ -73,7 +73,6 @@ public interface IMetadata {
         getMetadataMap().put(LogUnitMetadataType.CLIENT_ID, clientId);
     }
 
-    @SuppressWarnings("unchecked")
     @Nullable
     default UUID getClientId() {
         return (UUID) getMetadataMap().getOrDefault(LogUnitMetadataType.CLIENT_ID, null);
@@ -83,7 +82,6 @@ public interface IMetadata {
         getMetadataMap().put(LogUnitMetadataType.THREAD_ID, threadId);
     }
 
-    @SuppressWarnings("unchecked")
     @Nullable
     default Long getThreadId() {
         return (Long) getMetadataMap().getOrDefault(LogUnitMetadataType.THREAD_ID, null);
@@ -94,7 +92,6 @@ public interface IMetadata {
      *
      * @return global address
      */
-    @SuppressWarnings("unchecked")
     default Long getGlobalAddress() {
         return Optional.ofNullable((Long) getMetadataMap()
                 .get(LogUnitMetadataType.GLOBAL_ADDRESS)).orElse(Address.NON_ADDRESS);

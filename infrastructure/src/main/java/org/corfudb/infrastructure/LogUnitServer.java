@@ -6,6 +6,11 @@ import io.netty.channel.ChannelHandlerContext;
 import lombok.Builder;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
+import org.corfudb.infrastructure.BatchProcessor.BatchProcessorContext;
+import org.corfudb.infrastructure.BatchProcessor.ExitManager;
+import org.corfudb.infrastructure.health.Component;
+import org.corfudb.infrastructure.health.HealthMonitor;
+import org.corfudb.infrastructure.health.Issue;
 import org.corfudb.infrastructure.log.InMemoryStreamLog;
 import org.corfudb.infrastructure.log.StreamLog;
 import org.corfudb.infrastructure.log.StreamLogCompaction;
@@ -27,6 +32,7 @@ import org.corfudb.runtime.proto.service.CorfuMessage.HeaderMsg;
 import org.corfudb.runtime.proto.service.CorfuMessage.PriorityLevel;
 import org.corfudb.runtime.proto.service.CorfuMessage.RequestMsg;
 import org.corfudb.runtime.proto.service.CorfuMessage.RequestPayloadMsg.PayloadCase;
+import org.corfudb.runtime.proto.service.CorfuMessage.ResponseMsg;
 import org.corfudb.runtime.view.stream.StreamAddressSpace;
 import org.corfudb.util.Utils;
 
@@ -55,8 +61,8 @@ import static org.corfudb.protocols.service.CorfuProtocolLogUnit.getFlushCacheRe
 import static org.corfudb.protocols.service.CorfuProtocolLogUnit.getInspectAddressesResponseMsg;
 import static org.corfudb.protocols.service.CorfuProtocolLogUnit.getKnownAddressResponseMsg;
 import static org.corfudb.protocols.service.CorfuProtocolLogUnit.getLogAddressSpaceResponseMsg;
-import static org.corfudb.protocols.service.CorfuProtocolLogUnit.getRangeWriteLogResponseMsg;
 import static org.corfudb.protocols.service.CorfuProtocolLogUnit.getReadLogResponseMsg;
+import static org.corfudb.protocols.service.CorfuProtocolLogUnit.getRangeWriteLogResponseMsg;
 import static org.corfudb.protocols.service.CorfuProtocolLogUnit.getResetLogUnitResponseMsg;
 import static org.corfudb.protocols.service.CorfuProtocolLogUnit.getTailResponseMsg;
 import static org.corfudb.protocols.service.CorfuProtocolLogUnit.getTrimLogResponseMsg;
@@ -114,7 +120,7 @@ public class LogUnitServer extends AbstractServer {
     @Getter
     private final StreamLog streamLog;
     private final StreamLogCompaction logCleaner;
-    private final BatchProcessor batchWriter;
+    private final BatchProcessor batchProcessor;
     private final ExecutorService executor;
 
     /**
@@ -129,14 +135,17 @@ public class LogUnitServer extends AbstractServer {
     /**
      * Returns a new LogUnitServer.
      *
-     * @param serverContext      context object providing settings and objects
-     * @param serverInitializer  a LogUnitServerInitializer object used for initializing the
-     *                           cache, stream log, and batch processor for this server
+     * @param serverContext     context object providing settings and objects
+     * @param serverInitializer a LogUnitServerInitializer object used for initializing the
+     *                          cache, stream log, and batch processor for this server
      */
     public LogUnitServer(ServerContext serverContext, LogUnitServerInitializer serverInitializer) {
         this.serverContext = serverContext;
         config = LogUnitServerConfig.parse(serverContext.getServerConfig());
         executor = serverContext.getExecutorService(serverContext.getLogUnitThreadCount(), "LogUnit-");
+        HealthMonitor.reportIssue(Issue.createInitIssue(Component.LOG_UNIT));
+
+        BatchProcessorContext batchProcessorContext = new BatchProcessorContext();
 
         if (config.isMemoryMode()) {
             log.warn("Log unit opened in-memory mode (Maximum size={}). "
@@ -145,13 +154,13 @@ public class LogUnitServer extends AbstractServer {
                     + "AUTOMATICALLY trimmed. "
                     + "The unit WILL LOSE ALL DATA if it exits.", Utils
                     .convertToByteStringRepresentation(config.getMaxCacheSize()));
-            streamLog = serverInitializer.buildInMemoryStreamLog();
+            streamLog = serverInitializer.buildInMemoryStreamLog(batchProcessorContext);
         } else {
-            streamLog = serverInitializer.buildStreamLog(config, serverContext);
+            streamLog = serverInitializer.buildStreamLog(config, serverContext, batchProcessorContext);
         }
 
         dataCache = serverInitializer.buildLogUnitServerCache(config, streamLog);
-        batchWriter = serverInitializer.buildBatchProcessor(config, streamLog, serverContext);
+        batchProcessor = serverInitializer.buildBatchProcessor(config, streamLog, serverContext, batchProcessorContext);
         logCleaner = serverInitializer.buildStreamLogCompaction(streamLog);
     }
 
@@ -170,12 +179,12 @@ public class LogUnitServer extends AbstractServer {
                     req.getHeader().getRequestId(), TextFormat.shortDebugString(req));
         }
 
-        batchWriter.<TailsResponse>addTask(BatchWriterOperation.Type.TAILS_QUERY, req)
+        batchProcessor.<TailsResponse>addTask(BatchWriterOperation.Type.TAILS_QUERY, req)
                 .thenAccept(tailsResp ->
-                    // Note: we reuse the request header as the ignore_cluster_id and
-                    // ignore_epoch fields are the same in both cases.
-                    router.sendResponse(getResponseMsg(getHeaderMsg(req.getHeader()), getTailResponseMsg(
-                            tailsResp.getEpoch(), tailsResp.getLogTail(), tailsResp.getStreamTails())), ctx))
+                        // Note: we reuse the request header as the ignore_cluster_id and
+                        // ignore_epoch fields are the same in both cases.
+                        router.sendResponse(getResponseMsg(getHeaderMsg(req.getHeader()), getTailResponseMsg(
+                                tailsResp.getEpoch(), tailsResp.getLogTail(), tailsResp.getStreamTails())), ctx))
                 .exceptionally(ex -> {
                     handleException(ex, ctx, req, router);
                     return null;
@@ -193,12 +202,12 @@ public class LogUnitServer extends AbstractServer {
                     "address space request {}", req.getHeader().getRequestId(), TextFormat.shortDebugString(req));
         }
 
-        batchWriter.<StreamsAddressResponse>addTask(BatchWriterOperation.Type.LOG_ADDRESS_SPACE_QUERY, req)
+        batchProcessor.<StreamsAddressResponse>addTask(BatchWriterOperation.Type.LOG_ADDRESS_SPACE_QUERY, req)
                 .thenAccept(resp ->
-                    // Note: we reuse the request header as the ignore_cluster_id and
-                    // ignore_epoch fields are the same in both cases.
-                    router.sendResponse(getResponseMsg(getHeaderMsg(req.getHeader()),
-                            getLogAddressSpaceResponseMsg(resp.getLogTail(), resp.getEpoch(), resp.getAddressMap())), ctx))
+                        // Note: we reuse the request header as the ignore_cluster_id and
+                        // ignore_epoch fields are the same in both cases.
+                        router.sendResponse(getResponseMsg(getHeaderMsg(req.getHeader()),
+                                getLogAddressSpaceResponseMsg(resp.getLogTail(), resp.getEpoch(), resp.getAddressMap())), ctx))
                 .exceptionally(ex -> {
                     handleException(ex, ctx, req, router);
                     return null;
@@ -232,8 +241,11 @@ public class LogUnitServer extends AbstractServer {
 
         // Note: we reuse the request header as the ignore_cluster_id and
         // ignore_epoch fields are the same in both cases.
-        router.sendResponse(getResponseMsg(getHeaderMsg(req.getHeader()),
-                getCommittedTailResponseMsg(streamLog.getCommittedTail())), ctx);
+        ResponseMsg committedTailResp = getResponseMsg(
+                getHeaderMsg(req.getHeader()),
+                getCommittedTailResponseMsg(streamLog.getCommittedTail())
+        );
+        router.sendResponse(committedTailResp, ctx);
     }
 
     /**
@@ -297,7 +309,7 @@ public class LogUnitServer extends AbstractServer {
         }
 
         final RequestMsg batchProcessorReq = req;
-        batchWriter.addTask(BatchWriterOperation.Type.WRITE, batchProcessorReq)
+        batchProcessor.addTask(BatchWriterOperation.Type.WRITE, batchProcessorReq)
                 .thenRunAsync(() -> {
                     dataCache.put(logData.getGlobalAddress(), logData);
                     HeaderMsg responseHeader = getHeaderMsg(batchProcessorReq.getHeader());
@@ -320,7 +332,7 @@ public class LogUnitServer extends AbstractServer {
         log.debug("handleRangeWrite: {} size [{}-{}]", range.size(),
                 range.get(0).getGlobalAddress(), range.get(range.size() - 1).getGlobalAddress());
 
-        batchWriter.addTask(BatchWriterOperation.Type.RANGE_WRITE, req)
+        batchProcessor.addTask(BatchWriterOperation.Type.RANGE_WRITE, req)
                 .thenRun(() -> router.sendResponse(getResponseMsg(getHeaderMsg(req.getHeader()),
                         getRangeWriteLogResponseMsg()), ctx))
                 .exceptionally(ex -> {
@@ -343,7 +355,7 @@ public class LogUnitServer extends AbstractServer {
                     TextFormat.shortDebugString(req.getPayload().getTrimLogRequest().getAddress()));
         }
 
-        batchWriter.addTask(BatchWriterOperation.Type.PREFIX_TRIM, req)
+        batchProcessor.addTask(BatchWriterOperation.Type.PREFIX_TRIM, req)
                 .thenRun(() -> {
                     HeaderMsg header = getHeaderMsg(req.getHeader(), ClusterIdCheck.CHECK, EpochCheck.IGNORE);
                     router.sendResponse(getResponseMsg(header, getTrimLogResponseMsg()), ctx);
@@ -426,8 +438,11 @@ public class LogUnitServer extends AbstractServer {
 
             // Note: we reuse the request header as the ignore_cluster_id and
             // ignore_epoch fields are the same in both cases.
-            router.sendResponse(getResponseMsg(getHeaderMsg(req.getHeader()),
-                    getKnownAddressResponseMsg(knownAddresses)), ctx);
+            ResponseMsg responseMsg = getResponseMsg(
+                    getHeaderMsg(req.getHeader()),
+                    getKnownAddressResponseMsg(knownAddresses)
+            );
+            router.sendResponse(responseMsg, ctx);
         } catch (Exception e) {
             handleException(e, ctx, req, router);
         }
@@ -478,7 +493,7 @@ public class LogUnitServer extends AbstractServer {
         );
 
         try {
-            batchWriter.addTask(BatchWriterOperation.Type.SEAL, batchProcessorReq).join();
+            batchProcessor.addTask(BatchWriterOperation.Type.SEAL, batchProcessorReq).join();
         } catch (CompletionException ce) {
             if (ce.getCause() instanceof WrongEpochException) {
                 // The BaseServer expects to observe this exception,
@@ -513,7 +528,7 @@ public class LogUnitServer extends AbstractServer {
 
         serverContext.setLogUnitEpochWaterMark(req.getPayload().getResetLogUnitRequest().getEpoch());
 
-        batchWriter.addTask(BatchWriterOperation.Type.RESET, req)
+        batchProcessor.addTask(BatchWriterOperation.Type.RESET, req)
                 .thenRun(() -> {
                     dataCache.invalidateAll();
                     log.info("handleResetLogUnit: LogUnit server reset.");
@@ -534,8 +549,9 @@ public class LogUnitServer extends AbstractServer {
         super.shutdown();
         executor.shutdown();
         logCleaner.shutdown();
-        batchWriter.close();
+        batchProcessor.close();
         streamLog.close();
+        HealthMonitor.reportIssue(Issue.createInitIssue(Component.LOG_UNIT));
     }
 
     @VisibleForTesting
@@ -567,7 +583,6 @@ public class LogUnitServer extends AbstractServer {
         private final double cacheSizeHeapRatio;
         private final long maxCacheSize;
         private final boolean memoryMode;
-        private final boolean noVerify;
         private final boolean noSync;
 
         /**
@@ -583,7 +598,6 @@ public class LogUnitServer extends AbstractServer {
                     .cacheSizeHeapRatio(cacheSizeHeapRatio)
                     .maxCacheSize((long) (Runtime.getRuntime().maxMemory() * cacheSizeHeapRatio))
                     .memoryMode(Boolean.parseBoolean(opts.get("--memory").toString()))
-                    .noVerify((Boolean) opts.get("--no-verify"))
                     .noSync((Boolean) opts.get("--no-sync"))
                     .build();
         }
@@ -595,13 +609,14 @@ public class LogUnitServer extends AbstractServer {
      * This facilitates the injection of mocked objects during unit tests.
      */
     public static class LogUnitServerInitializer {
-        StreamLog buildInMemoryStreamLog() {
-            return new InMemoryStreamLog();
+        StreamLog buildInMemoryStreamLog(@Nonnull BatchProcessorContext batchProcessorContext) {
+            return new InMemoryStreamLog(batchProcessorContext);
         }
 
         StreamLog buildStreamLog(@Nonnull LogUnitServerConfig config,
-                                 @Nonnull ServerContext serverContext) {
-            return new StreamLogFiles(serverContext, config.isNoVerify());
+                                 @Nonnull ServerContext serverContext,
+                                 @Nonnull BatchProcessorContext batchProcessorContext) {
+            return new StreamLogFiles(serverContext, batchProcessorContext);
         }
 
         LogUnitServerCache buildLogUnitServerCache(@Nonnull LogUnitServerConfig config,
@@ -611,8 +626,11 @@ public class LogUnitServer extends AbstractServer {
 
         BatchProcessor buildBatchProcessor(@Nonnull LogUnitServerConfig config,
                                            @Nonnull StreamLog streamLog,
-                                           @Nonnull ServerContext serverContext) {
-            return new BatchProcessor(streamLog, serverContext.getServerEpoch(), !config.isNoSync());
+                                           @Nonnull ServerContext serverContext,
+                                           @Nonnull BatchProcessorContext batchProcessorContext) {
+            return new BatchProcessor(
+                    streamLog, batchProcessorContext, new ExitManager(), serverContext.getServerEpoch(), !config.isNoSync()
+            );
         }
 
         StreamLogCompaction buildStreamLogCompaction(@Nonnull StreamLog streamLog) {

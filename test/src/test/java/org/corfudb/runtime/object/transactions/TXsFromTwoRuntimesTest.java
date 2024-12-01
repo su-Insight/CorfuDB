@@ -1,16 +1,16 @@
 package org.corfudb.runtime.object.transactions;
 
-import static org.assertj.core.api.Assertions.assertThat;
 import com.google.common.reflect.TypeToken;
-
-import java.util.concurrent.Semaphore;
-
 import org.corfudb.runtime.CorfuRuntime;
 import org.corfudb.runtime.collections.ICorfuTable;
-import org.corfudb.runtime.collections.CorfuTable;
+import org.corfudb.runtime.collections.PersistentCorfuTable;
 import org.corfudb.runtime.exceptions.AbortCause;
 import org.corfudb.runtime.exceptions.TransactionAbortedException;
 import org.junit.Test;
+
+import java.util.concurrent.Semaphore;
+
+import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * Created by dalia on 1/6/17.
@@ -39,7 +39,7 @@ public class TXsFromTwoRuntimesTest extends AbstractTransactionsTest {
                     myruntime.getObjectsView()
                             .build()
                             .setStreamName("nonidepmpotentmaptest")    // stream name
-                            .setTypeToken(new TypeToken<CorfuTable<Integer, Integer>>() {}) // object TokenType class 
+                            .setTypeToken(new TypeToken<PersistentCorfuTable<Integer, Integer>>() {}) // object TokenType class
                             .open() ;
 
             assertThat(mymap.get("world1"))
@@ -47,7 +47,7 @@ public class TXsFromTwoRuntimesTest extends AbstractTransactionsTest {
 
             for (int t = 0; t < nTXs; t++) {
                 myruntime.getObjectsView().TXBegin();
-                mymap.put(nTXs+t, t);
+                mymap.insert(nTXs+t, t);
                 myruntime.getObjectsView().TXEnd();
             }
             // expect to see nTXS entries in this map
@@ -73,18 +73,18 @@ public class TXsFromTwoRuntimesTest extends AbstractTransactionsTest {
             CorfuRuntime myruntime = getNewRuntime(getDefaultNode());
             myruntime.connect();
 
-            CorfuTable<Integer, Integer> mymap =
+            ICorfuTable<Integer, Integer> mymap =
                     myruntime.getObjectsView()
                         .build()
                             .setStreamName("nonidepmpotentmaptest")    // stream name
-                            .setTypeToken(new TypeToken<CorfuTable<Integer, Integer>>() {}) // object TokenType class 
+                            .setTypeToken(new TypeToken<PersistentCorfuTable<Integer, Integer>>() {}) // object TokenType class
                         .open();
 
             // start a transaction and then hand over to thread 1
             myruntime.getObjectsView().TXBegin();
             assertThat(mymap.get(nTXs))
                     .isEqualTo(null);
-            mymap.put(0, mymap.size());
+            mymap.insert(0, mymap.size());
 
             // enable thread1: it will do nTXS increments on the stream
             thread1.start();
@@ -145,7 +145,7 @@ public class TXsFromTwoRuntimesTest extends AbstractTransactionsTest {
                     myruntime.getObjectsView()
                             .build()
                             .setStreamName("nonidepmpotentmaptest")    // stream name
-                            .setTypeToken(new TypeToken<CorfuTable<Integer, Integer>>() {}) // object TokenType class
+                            .setTypeToken(new TypeToken<PersistentCorfuTable<Integer, Integer>>() {}) // object TokenType class
                             .open() ;
 
             assertThat(mymap.get("world1"))
@@ -153,7 +153,7 @@ public class TXsFromTwoRuntimesTest extends AbstractTransactionsTest {
 
             for (int t = 0; t < nTXs; t++) {
                 myruntime.getObjectsView().TXBegin();
-                mymap.put(nTXs+t, t);
+                mymap.insert(nTXs+t, t);
                 myruntime.getObjectsView().TXEnd();
             }
             // expect to see nTXS entries in this map
@@ -185,17 +185,13 @@ public class TXsFromTwoRuntimesTest extends AbstractTransactionsTest {
                     myruntime.getObjectsView()
                             .build()
                             .setStreamName("nonidepmpotentmaptest")    // stream name
-                            .setTypeToken(new TypeToken<CorfuTable<Integer, Integer>>() {}) // object TokenType class
+                            .setTypeToken(new TypeToken<PersistentCorfuTable<Integer, Integer>>() {}) // object TokenType class
                             .open();
 
                     // start a transaction and then hand over to thread 1
             myruntime.getObjectsView().TXBegin();
             assertThat(mymap.get(0))
                     .isEqualTo(null);
-            mymap.computeIfAbsent(0, (K) -> {
-                // should be computed deterministically, does it?
-                return mymap.size();
-            });
 
             // enable thread1: it will do nTXS increments on the stream
             thread1.start();

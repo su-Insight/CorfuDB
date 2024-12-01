@@ -1,11 +1,12 @@
 package org.corfudb.infrastructure.logreplication.replication;
 
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
+import lombok.Getter;
 import lombok.ToString;
 import lombok.extern.slf4j.Slf4j;
 import org.corfudb.infrastructure.logreplication.LogReplicationConfig;
-import org.corfudb.infrastructure.logreplication.proto.LogReplicationMetadata.SyncStatus;
 import org.corfudb.infrastructure.logreplication.proto.LogReplicationMetadata.ReplicationStatusVal.SyncType;
+import org.corfudb.infrastructure.logreplication.proto.LogReplicationMetadata.SyncStatus;
 import org.corfudb.infrastructure.logreplication.replication.receive.LogReplicationMetadataManager;
 import org.corfudb.infrastructure.logreplication.replication.send.LogEntrySender;
 import org.corfudb.infrastructure.logreplication.replication.send.logreader.LogEntryReader;
@@ -32,6 +33,7 @@ import java.util.concurrent.locks.ReentrantLock;
 @ToString
 @Slf4j
 public class LogReplicationAckReader {
+    @Getter
     private final LogReplicationMetadataManager metadataManager;
     private final LogReplicationConfig config;
     private final CorfuRuntime runtime;
@@ -52,8 +54,8 @@ public class LogReplicationAckReader {
     // Last ack'd timestamp from Receiver
     private long lastAckedTimestamp = Address.NON_ADDRESS;
 
-    // Sync Type for which last Ack was received. Default to LOG_ENTRY as this is the initial FSM state
-    private SyncType lastSyncType = SyncType.LOG_ENTRY;
+    // Sync Type for which last Ack was received, it is initialized when setSyncType is called
+    private SyncType lastSyncType = null;
 
     private LogEntryReader logEntryReader;
 
@@ -343,27 +345,37 @@ public class LogReplicationAckReader {
         this.baseSnapshotTimestamp = baseSnapshotTimestamp;
     }
 
-    public void markSnapshotSyncInfoCompleted() {
+    /**
+     * This method updates the sync status on the Source cluster with:
+     * Sync Type = LOG_ENTRY
+     * Sync Status = ONGOING
+     * Additionally, it updates the timestamp and status of the last completed snapshot sync if
+     * updateSnapshotSyncInfo is true
+     * @param updateSnapshotSyncInfo
+     */
+    public void markLogEntrySyncOngoing(boolean updateSnapshotSyncInfo) {
         try {
             IRetry.build(IntervalRetry.class, () -> {
                 try {
                     lock.lock();
-                    metadataManager.updateSnapshotSyncStatusCompleted(remoteClusterId,
-                            calculateRemainingEntriesToSend(baseSnapshotTimestamp), baseSnapshotTimestamp);
+                    metadataManager.setLogEntrySyncOngoing(remoteClusterId,
+                            calculateRemainingEntriesToSend(baseSnapshotTimestamp), updateSnapshotSyncInfo,
+                            baseSnapshotTimestamp);
                 } catch (TransactionAbortedException tae) {
-                    log.error("Error while attempting to markSnapshotSyncInfoCompleted for remote cluster {}.", remoteClusterId, tae);
+                    log.error("Error while attempting markLogEntrySyncOngoing for remote cluster {}.", remoteClusterId,
+                        tae);
                     throw new RetryNeededException();
                 } finally {
                     lock.unlock();
                 }
 
                 if (log.isTraceEnabled()) {
-                    log.trace("markSnapshotSyncInfoCompleted succeeds for remote cluster {}.", remoteClusterId);
+                    log.trace("markLogEntrySyncOngoing succeeds for remote cluster {}.", remoteClusterId);
                 }
                 return null;
             }).run();
         } catch (InterruptedException e) {
-            log.error("Unrecoverable exception when attempting to markSnapshotSyncInfoCompleted.", e);
+            log.error("Unrecoverable exception when attempting to markLogEntrySyncOngoing.", e);
             throw new UnrecoverableCorfuInterruptedError(e);
         }
     }
@@ -399,7 +411,7 @@ public class LogReplicationAckReader {
             IRetry.build(IntervalRetry.class, () -> {
                 try {
                     lock.lock();
-                    metadataManager.updateSyncStatus(remoteClusterId, SyncType.SNAPSHOT, SyncStatus.ONGOING);
+                    metadataManager.updateSyncStatus(remoteClusterId, lastSyncType, SyncStatus.ONGOING);
                 } catch (TransactionAbortedException tae) {
                     log.error("Error while attempting to markSnapshotSyncInfoOngoing for cluster {}.", remoteClusterId, tae);
                     throw new RetryNeededException();
@@ -470,10 +482,14 @@ public class LogReplicationAckReader {
                 IRetry.build(IntervalRetry.class, () -> {
                     try {
                         lock.lock();
+                        if (lastSyncType == null) {
+                            log.info("lastSyncType is null before polling task run");
+                            return null;
+                        }
                         long entriesToSend = calculateRemainingEntriesToSend(lastAckedTimestamp);
-                        metadataManager.setReplicationStatusTable(remoteClusterId, entriesToSend, lastSyncType);
+                        metadataManager.updateRemainingEntriesToSend(remoteClusterId, entriesToSend, lastSyncType);
                     } catch (TransactionAbortedException tae) {
-                        log.error("Error while attempting to set replication status for " +
+                        log.error("Error while attempting to set remaining entries for " +
                                         "remote cluster {} with lastSyncType {}.",
                                 remoteClusterId, lastSyncType, tae);
                         throw new RetryNeededException();
@@ -484,7 +500,7 @@ public class LogReplicationAckReader {
                     return null;
                 }).run();
             } catch (InterruptedException e) {
-                log.error("Unrecoverable exception when attempting to setReplicationStatusTable", e);
+                log.error("Unrecoverable exception when attempting to updateRemainingEntriesToSend", e);
                 throw new UnrecoverableCorfuInterruptedError(e);
             }
         }

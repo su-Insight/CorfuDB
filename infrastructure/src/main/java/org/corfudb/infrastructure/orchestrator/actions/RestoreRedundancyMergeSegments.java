@@ -7,7 +7,6 @@ import lombok.Builder.Default;
 import lombok.Getter;
 import lombok.NonNull;
 import lombok.extern.slf4j.Slf4j;
-import org.corfudb.common.metrics.micrometer.MeterRegistryProvider;
 import org.corfudb.infrastructure.log.statetransfer.StateTransferManager;
 import org.corfudb.infrastructure.log.statetransfer.batchprocessor.committedbatchprocessor.CommittedBatchProcessor;
 import org.corfudb.infrastructure.log.statetransfer.batchprocessor.protocolbatchprocessor.ProtocolBatchProcessor;
@@ -129,13 +128,13 @@ public class RestoreRedundancyMergeSegments extends Action {
                 long trimMark = trimLog(runtime, currentLayout);
 
                 // Retrieve a current cluster committed tail.
-                Optional<Long> committedTail =
-                        tryGetCommittedTail(runtime.getLayoutView().getRuntimeLayout());
+                Optional<Long> committedTail = tryGetCommittedTail(runtime.getLayoutView().getRuntimeLayout());
 
                 // Execute state transfer and return the list of transferred transfer segments.
-                ImmutableList<TransferSegment> transferredSegments = ImmutableList.copyOf(
-                        getTransferSegments(transferManager, currentLayout,
-                                trimMark, committedTail));
+                List<TransferSegment> transferSegments = getTransferSegments(
+                        transferManager, currentLayout, trimMark, committedTail
+                );
+                ImmutableList<TransferSegment> transferredSegments = ImmutableList.copyOf(transferSegments);
 
                 // Get segments that were trimmed but do not include the current node, if any.
                 ImmutableList<TransferSegment> trimmedNotRestoredSegments =
@@ -280,7 +279,7 @@ public class RestoreRedundancyMergeSegments extends Action {
         log.info("getTransferSegments: transfer workload: {}", transferSegmentRanges);
 
         // Perform a state transfer on the transfer segment ranges and return the updated
-        // transferred transfer segment list.
+        // transferred segment list.
         ImmutableList<TransferSegment> transferList = transferManager
                 .handleTransfer(transferSegmentRanges);
 

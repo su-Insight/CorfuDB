@@ -2,10 +2,11 @@ package org.corfudb.runtime.object;
 
 import com.google.common.reflect.TypeToken;
 import org.corfudb.runtime.CorfuRuntime;
-import org.corfudb.runtime.collections.CorfuTable;
+import org.corfudb.runtime.collections.PersistentCorfuTable;
 import org.corfudb.runtime.view.SMRObject;
 import org.corfudb.util.ReflectionUtils;
 import org.junit.Test;
+
 import java.lang.reflect.InvocationTargetException;
 
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -52,8 +53,8 @@ public class ObjectBuilderTest {
         CorfuRuntime rt = new CorfuRuntime();
         assertThatThrownBy(() -> {
             SMRObject.builder()
-                    .runtime(rt)
-                    .setTypeToken(new TypeToken<CorfuTable<String, String>>() {})
+                    .setCorfuRuntime(rt)
+                    .setTypeToken(new TypeToken<PersistentCorfuTable<String, String>>() {})
                     .open();
         }).isInstanceOf(NullPointerException.class)
           .hasMessageStartingWith("streamID is marked non-null but is null");

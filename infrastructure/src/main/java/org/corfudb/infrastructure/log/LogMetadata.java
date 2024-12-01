@@ -5,8 +5,8 @@ import lombok.ToString;
 import lombok.extern.slf4j.Slf4j;
 import org.corfudb.protocols.logprotocol.CheckpointEntry;
 import org.corfudb.protocols.wireprotocol.LogData;
-import org.corfudb.runtime.view.stream.StreamAddressSpace;
 import org.corfudb.runtime.view.Address;
+import org.corfudb.runtime.view.stream.StreamAddressSpace;
 
 import javax.annotation.concurrent.NotThreadSafe;
 import java.util.Collections;
@@ -14,6 +14,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+
+import static org.corfudb.infrastructure.log.StreamLogFiles.RECORDS_PER_LOG_FILE;
 
 
 /**
@@ -29,6 +31,8 @@ import java.util.UUID;
 @Slf4j
 public class LogMetadata {
 
+    private final StreamLogDataStore dataStore;
+
     @Getter
     private volatile long globalTail;
 
@@ -38,10 +42,11 @@ public class LogMetadata {
     @Getter
     private final Map<UUID, Long> streamTails;
 
-    public LogMetadata() {
+    public LogMetadata(StreamLogDataStore dataStore) {
         this.globalTail = Address.NON_ADDRESS;
         this.streamTails = new HashMap<>();
         this.streamsAddressSpaceMap = new HashMap<>();
+        this.dataStore = dataStore;
     }
 
     public void update(List<LogData> entries) {
@@ -157,5 +162,15 @@ public class LogMetadata {
                     streamAddressMap.getKey(), address);
             streamAddressMap.getValue().trim(address);
         }
+    }
+
+    public void syncTailSegment(long address) {
+        // TODO(Maithem) since writing a record and setting the tail segment is not
+        // an atomic operation, it is possible to set an incorrect tail segment. In
+        // that case we will need to scan more than one segment
+        updateGlobalTail(address);
+        long segment = address / RECORDS_PER_LOG_FILE;
+
+        dataStore.updateTailSegment(segment);
     }
 }

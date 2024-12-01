@@ -1,6 +1,13 @@
 package org.corfudb.protocols.logprotocol;
 
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
+import lombok.Getter;
+import lombok.NoArgsConstructor;
+import lombok.RequiredArgsConstructor;
+import lombok.ToString;
+import org.corfudb.runtime.CorfuRuntime;
+import org.corfudb.util.serializer.CorfuSerializer;
 
 import java.util.Arrays;
 import java.util.HashMap;
@@ -8,15 +15,6 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.function.Function;
 import java.util.stream.Collectors;
-
-import io.netty.buffer.Unpooled;
-import lombok.Getter;
-import lombok.NoArgsConstructor;
-import lombok.RequiredArgsConstructor;
-import lombok.Setter;
-import lombok.ToString;
-import org.corfudb.runtime.CorfuRuntime;
-import org.corfudb.util.serializer.CorfuSerializer;
 
 
 /**
@@ -178,6 +176,22 @@ public class CheckpointEntry extends LogEntry {
                 smrEntries = (MultiSMREntry) MultiSMREntry.deserialize(b, runtime, true);
             } else {
                 smrEntries = (MultiSMREntry) MultiSMREntry.deserialize(b, runtime, false);
+            }
+            streamUpdates = null;
+        }
+
+        return smrEntries;
+    }
+
+    // refactored version
+    public synchronized MultiSMREntry getSmrEntries(boolean opaque, CorfuRuntime rt) {
+        if (streamUpdates != null) {
+            ByteBuf b = Unpooled.wrappedBuffer(streamUpdates);
+            b.readByte(); // remove magic
+            if (opaque) {
+                smrEntries = (MultiSMREntry) MultiSMREntry.deserialize(b, rt, true);
+            } else {
+                smrEntries = (MultiSMREntry) MultiSMREntry.deserialize(b, rt, false);
             }
             streamUpdates = null;
         }

@@ -1,13 +1,14 @@
 package org.corfudb.runtime.object.transactions;
 
-import java.util.List;
-import java.util.UUID;
-
 import org.corfudb.protocols.logprotocol.SMREntry;
 import org.corfudb.runtime.exceptions.TransactionAbortedException;
-import org.corfudb.runtime.object.ICorfuSMR;
+import org.corfudb.runtime.object.ConsistencyView;
 import org.corfudb.runtime.object.ICorfuSMRAccess;
-import org.corfudb.runtime.object.ICorfuSMRProxyInternal;
+import org.corfudb.runtime.object.MVOCorfuCompileProxy;
+import org.corfudb.runtime.object.SnapshotGenerator;
+
+import java.util.List;
+import java.util.UUID;
 
 /**
  * A snapshot transactional context.
@@ -28,18 +29,15 @@ public class SnapshotTransactionalContext extends AbstractTransactionalContext {
      * {@inheritDoc}
      */
     @Override
-    public <R, T extends ICorfuSMR<T>> R access(ICorfuSMRProxyInternal<T> proxy,
-                                                ICorfuSMRAccess<R, T> accessFunction,
-                                                Object[] conflictObject) {
-        // In snapshot transactions, there are no conflicts.
-        // Hence, we do not need to add this access to a conflict set
-        // do not add: addToReadSet(proxy, conflictObject);
-        return proxy.getUnderlyingObject().access(o -> o.getVersionUnsafe()
-                        == getSnapshotTimestamp().getSequence()
-                        && !o.isOptimisticallyModifiedUnsafe(),
-                o -> syncWithRetryUnsafe(o, getSnapshotTimestamp(), proxy, null),
-                accessFunction::access,
-                version -> updateKnownStreamPosition(proxy.getStreamID(), version));
+    public <R, S extends SnapshotGenerator<S> & ConsistencyView> R access(
+            MVOCorfuCompileProxy<S> proxy, ICorfuSMRAccess<R, S> accessFunction, Object[] conflictObject) {
+        long startAccessTime = System.nanoTime();
+        try {
+            return getAndCacheSnapshotProxy(proxy, getSnapshotTimestamp().getSequence())
+                    .access(accessFunction, version -> updateKnownStreamPosition(proxy, version));
+        } finally {
+            dbNanoTime += (System.nanoTime() - startAccessTime);
+        }
     }
 
     /**
@@ -47,21 +45,14 @@ public class SnapshotTransactionalContext extends AbstractTransactionalContext {
      */
     @Override
     public long commitTransaction() throws TransactionAbortedException {
-        return getMaxAddressRead();
-    }
-
-    /**
-     * Get the result of an upcall.
-     *
-     * @param proxy     The proxy to retrieve the upcall for.
-     * @param timestamp The timestamp to return the upcall for.
-     * @return The result of the upcall.
-     */
-    @Override
-    public <T extends ICorfuSMR<T>> Object getUpcallResult(ICorfuSMRProxyInternal<T> proxy,
-                                                            long timestamp,
-                                                            Object[] conflictObject) {
-        throw new UnsupportedOperationException("Can't get upcall during a read-only transaction!");
+        // If the transaction has read monotonic objects, we instead return the min address
+        // of all accessed streams. Although this avoids data loss, clients subscribing at
+        // this point for delta/streaming may observe duplicate data.
+        if (accessedReadCommittedObject) {
+            return getMinAddressRead();
+        } else {
+            return getMaxAddressRead();
+        }
     }
 
     /**
@@ -72,9 +63,8 @@ public class SnapshotTransactionalContext extends AbstractTransactionalContext {
      * @return The address the update was written at.
      */
     @Override
-    public <T extends ICorfuSMR<T>> long logUpdate(ICorfuSMRProxyInternal<T> proxy,
-                                                    SMREntry updateEntry,
-                                                    Object[] conflictObject) {
+    public long logUpdate(MVOCorfuCompileProxy<?> proxy,
+                          SMREntry updateEntry, Object[] conflictObject) {
         throw new UnsupportedOperationException(
                 "Can't modify object during a read-only transaction!");
     }

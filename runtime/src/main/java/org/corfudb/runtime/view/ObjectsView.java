@@ -1,7 +1,7 @@
 package org.corfudb.runtime.view;
 
 import lombok.AllArgsConstructor;
-import lombok.Data;
+import lombok.Builder;
 import lombok.EqualsAndHashCode;
 import lombok.Getter;
 import lombok.NonNull;
@@ -18,8 +18,8 @@ import org.corfudb.runtime.exceptions.QuotaExceededException;
 import org.corfudb.runtime.exceptions.TransactionAbortedException;
 import org.corfudb.runtime.exceptions.WriteSizeException;
 import org.corfudb.runtime.exceptions.unrecoverable.UnrecoverableCorfuError;
-import org.corfudb.runtime.object.CorfuCompileProxy;
 import org.corfudb.runtime.object.ICorfuSMR;
+import org.corfudb.runtime.object.MVOCache;
 import org.corfudb.runtime.object.transactions.AbstractTransactionalContext;
 import org.corfudb.runtime.object.transactions.Transaction;
 import org.corfudb.runtime.object.transactions.Transaction.TransactionBuilder;
@@ -56,6 +56,10 @@ public class ObjectsView extends AbstractView {
     @Getter
     Map<ObjectID, Object> objectCache = new ConcurrentHashMap<>();
 
+    @Getter
+    @Setter
+    MVOCache mvoCache = new MVOCache(runtime);
+
     public ObjectsView(@Nonnull final CorfuRuntime runtime) {
         super(runtime);
     }
@@ -65,8 +69,8 @@ public class ObjectsView extends AbstractView {
      *
      * @return An object builder to open an object with.
      */
-    public SMRObject.Builder<?> build() {
-        return new SMRObject.Builder<>().runtime(runtime);
+    public <T extends ICorfuSMR<?>> SMRObject.Builder<T> build() {
+        return new SMRObject.Builder<T>().setCorfuRuntime(runtime);
     }
 
     /**
@@ -153,10 +157,22 @@ public class ObjectsView extends AbstractView {
         long totalTime = System.currentTimeMillis() - context.getStartTime();
         log.trace("TXEnd[{}] time={} ms", context, totalTime);
 
+        long txEndStartTime = System.nanoTime();
         try {
             long commitAddress = TransactionalContext.getCurrentContext().commitTransaction();
             MicroMeterUtils.time(Duration.ofMillis(System.currentTimeMillis() - context.getStartTime()),
                     "transaction.duration");
+            if (commitAddress == Address.NON_ADDRESS) {
+                // If no streams were touched or only empty streams were touched, the returned address would be -1
+                // But -1 can be detrimental to stream subscription which is just looking for a safe spot
+                // to resume subscription from, so instead return the address from the snapshot token taken.
+                long snapshotAddress = context.getSnapshotTimestamp().getSequence();
+                if (snapshotAddress >= 0) {
+                    // Perform a read at this address to force materialization.
+                    runtime.getAddressSpaceView().read(snapshotAddress);
+                }
+                return snapshotAddress;
+            }
             return commitAddress;
         } catch (TransactionAbortedException e) {
             log.warn("TXEnd[{}] Aborted Exception ", context, e);
@@ -199,6 +215,9 @@ public class ObjectsView extends AbstractView {
             context.abortTransaction(tae);
             throw new UnrecoverableCorfuError("Unexpected exception during commit", e);
         } finally {
+            long txEndEndTime = System.nanoTime();
+            MicroMeterUtils.time(Duration.ofNanos(context.dbNanoTime + (txEndEndTime - txEndStartTime)),
+                    "transaction.db.duration");
             TransactionalContext.removeContext();
         }
     }
@@ -209,16 +228,17 @@ public class ObjectsView extends AbstractView {
      */
     public void gc(long trimMark) {
         for (Object obj : getObjectCache().values()) {
-            ((CorfuCompileProxy) ((ICorfuSMR) obj).
-                    getCorfuSMRProxy()).getUnderlyingObject().gc(trimMark);
+            ((ICorfuSMR) obj).getCorfuSMRProxy().getUnderlyingMVO().gc(trimMark);
         }
     }
 
-    @Data
+    @Builder
+    @AllArgsConstructor
+    @EqualsAndHashCode
     @SuppressWarnings({"checkstyle:abbreviation"})
-    public static class ObjectID<T> {
+    public static class ObjectID {
         final UUID streamID;
-        final Class<T> type;
+        final Class<?> type;
 
         public String toString() {
             return "[" + streamID + ", " + type.getSimpleName() + "]";

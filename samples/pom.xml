@@ -42,14 +42,6 @@
             <artifactId>commons-lang</artifactId>
             <version>2.6</version>
         </dependency>
-
-
-        <!-- external dependencies -->
-        <dependency>
-            <groupId>com.google.protobuf</groupId>
-            <artifactId>protobuf-java</artifactId>
-            <version>3.6.1</version>
-        </dependency>
     </dependencies>
 
     <build>
@@ -65,7 +57,7 @@
                             <goal>run</goal>
                         </goals>
                         <configuration>
-                            <protocVersion>3.6.1</protocVersion>
+                            <protocVersion>${protobuf.version}</protocVersion>
                             <includeStdTypes>true</includeStdTypes>
                             <addProtoSources>inputs</addProtoSources>
                             <includeMavenTypes>direct</includeMavenTypes>

@@ -21,7 +21,7 @@ public class CorfuReplicationE2EIT extends LogReplicationAbstractIT {
 
     // Static method that generates and returns test data (automatically test for two transport protocols: netty and GRPC)
     @Parameterized.Parameters
-    public static Collection input() {
+    public static Collection<String> input() {
 
         List<String> transportPlugins = Arrays.asList(
                 "src/test/resources/transport/grpcConfig.properties",
@@ -52,31 +52,38 @@ public class CorfuReplicationE2EIT extends LogReplicationAbstractIT {
      *
      * This is a parameterized test and both plugins are tested.
      *
-     * @throws Exception
+     * @throws Exception error
      */
     @Test
     public void testLogReplicationEndToEnd() throws Exception {
         log.debug("Using plugin :: {}", pluginConfigFilePath);
-        testEndToEndSnapshotAndLogEntrySyncUFO(false);
+        testEndToEndSnapshotAndLogEntrySyncUFO(false, true);
     }
 
     @Test
     public void testSnapshotSyncMultipleTables() throws Exception {
         log.debug("Using plugin :: {}", pluginConfigFilePath);
         final int totalNumMaps = 3;
-        testEndToEndSnapshotAndLogEntrySyncUFO(totalNumMaps, false);
+        testEndToEndSnapshotAndLogEntrySyncUFO(totalNumMaps, false, true);
     }
 
     @Test
     public void testDiskBasedLogReplicationEndToEnd() throws Exception {
         log.debug("Using plugin :: {}", pluginConfigFilePath);
-        testEndToEndSnapshotAndLogEntrySyncUFO(true);
+        testEndToEndSnapshotAndLogEntrySyncUFO(true, true);
     }
 
     @Test
     public void testDiskBasedSnapshotSyncMultipleTables() throws Exception {
         log.debug("Using plugin :: {}", pluginConfigFilePath);
         final int totalNumMaps = 3;
-        testEndToEndSnapshotAndLogEntrySyncUFO(totalNumMaps, true);
+        testEndToEndSnapshotAndLogEntrySyncUFO(totalNumMaps, true, true);
+    }
+
+    @Test
+    public void testEventListenerE2E() throws Exception {
+        log.debug("Using plugin :: {}", pluginConfigFilePath);
+        final int totalNumMaps = 3;
+        testEventListenerEndToEnd(totalNumMaps);
     }
 }

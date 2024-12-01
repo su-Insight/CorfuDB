@@ -1,12 +1,13 @@
 package org.corfudb.runtime.object;
 
+import lombok.Data;
+import org.corfudb.protocols.logprotocol.SMREntry;
+import org.corfudb.protocols.wireprotocol.TokenResponse;
+
 import java.util.List;
 import java.util.UUID;
 import java.util.function.Function;
 import java.util.stream.Stream;
-
-import org.corfudb.protocols.logprotocol.SMREntry;
-import org.corfudb.protocols.wireprotocol.TokenResponse;
 
 /**
  * On top of a stream, an SMR object layer implements objects whose history of updates are backed
@@ -42,6 +43,8 @@ public interface ISMRStream {
 
     Stream<SMREntry> streamUpTo(long maxGlobal);
 
+    Stream<SingleAddressUpdates> streamUpToInList(long maxGlobal);
+
     /**
      * Append a SMREntry to the stream, returning the global address
      * it was written at.
@@ -72,4 +75,12 @@ public interface ISMRStream {
      */
     @SuppressWarnings("checkstyle:abbreviation")
     UUID getID();
+
+    @Data
+    class SingleAddressUpdates {
+
+        private final Long globalAddress;
+
+        private final List<SMREntry> smrEntryList;
+    }
 }

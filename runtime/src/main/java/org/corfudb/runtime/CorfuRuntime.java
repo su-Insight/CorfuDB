@@ -1,5 +1,6 @@
 package org.corfudb.runtime;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
 import io.micrometer.core.instrument.Timer;
 import io.netty.channel.ChannelOption;
@@ -14,6 +15,7 @@ import org.corfudb.common.compression.Codec;
 import org.corfudb.common.metrics.micrometer.MeterRegistryProvider;
 import org.corfudb.common.metrics.micrometer.MeterRegistryProvider.MeterRegistryInitializer;
 import org.corfudb.common.metrics.micrometer.MicroMeterUtils;
+import org.corfudb.util.FileWatcher;
 import org.corfudb.runtime.clients.BaseClient;
 import org.corfudb.runtime.clients.IClientRouter;
 import org.corfudb.runtime.clients.LayoutClient;
@@ -42,8 +44,11 @@ import org.corfudb.util.Sleep;
 import org.corfudb.util.serializer.Serializers;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.Marker;
+import org.slf4j.MarkerFactory;
 
 import javax.annotation.Nonnull;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -62,6 +67,9 @@ import java.util.function.BiFunction;
 import java.util.function.Function;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
+
+import static org.corfudb.common.metrics.micrometer.JVMMetrics.subscribeSafepointMetrics;
+import static org.corfudb.common.util.URLUtils.getVersionFormattedEndpointURL;
 
 /**
  * Created by mwei on 12/9/15.
@@ -141,7 +149,13 @@ public class CorfuRuntime {
      * Node Router Pool.
      */
     @Getter
-    private NodeRouterPool nodeRouterPool;
+    private volatile NodeRouterPool nodeRouterPool;
+
+    /**
+     * File watcher for SSL key store to support auto hot-swapping.
+     */
+    @Getter
+    private volatile Optional<FileWatcher> sslCertWatcher = Optional.empty();
 
     /**
      * A completable future containing a layout, when completed.
@@ -164,6 +178,8 @@ public class CorfuRuntime {
      */
     @Getter
     private volatile boolean isShutdown = false;
+
+    public static final Marker LOG_NOT_IMPORTANT = MarkerFactory.getMarker("NOT_IMPORTANT");
 
 
     /**
@@ -218,20 +234,29 @@ public class CorfuRuntime {
          */
         Duration holeFillTimeout = Duration.ofSeconds(10);
 
+        Duration mvoCacheExpiry = Duration.ofMinutes(10);
+
         /*
         * cache metrics are to be enabled only for the tuning exercise.
         */
         boolean cacheEntryMetricsDisabled = true;
 
         /*
-         * Whether or not to disable the cache.
+         * Whether to disable the cache (both AddressSpaceView readCache and MVO Cache).
          */
         boolean cacheDisabled = false;
 
         /*
-         * The maximum number of entries in the cache.
+         * The maximum number of entries in the AddressSpaceView cache.
+         * This will be overridden to 0 if cacheDisabled is true.
          */
-        long maxCacheEntries;
+        long maxCacheEntries = 500;
+
+        /*
+         * The maximum number of entries in the MVOCache.
+         * This will be overridden to 0 if cacheDisabled is true.
+         */
+        long maxMvoCacheEntries = 2500;
 
         /*
          * The max in-memory size of the cache in bytes
@@ -247,9 +272,10 @@ public class CorfuRuntime {
         int cacheConcurrencyLevel = 0;
 
         /*
-         * Sets expireAfterAccess and expireAfterWrite in seconds.
+         * Sets expireAfterAccess and expireAfterWrite for the AddressSpaceView cache in seconds.
          */
         long cacheExpiryTime = Long.MAX_VALUE;
+
         // endregion
 
         // region Stream Parameters
@@ -285,6 +311,16 @@ public class CorfuRuntime {
         int checkpointBatchSize = 50;
 
         /*
+         * The maximum size of an uncompressed CheckpointEntry.CONTINUATION that can be written
+         */
+        long maxUncompressedCpEntrySize = 100_000_000;
+
+        /*
+         * The maximum number of SMR entries that will be grouped in a MultiSMREntry during Restore
+         */
+        int restoreBatchSize = 50;
+
+        /*
          * Stream Batch Size: number of addresses to fetch in advance when stream address discovery mechanism
          * relies on address maps instead of follow backpointers, i.e., followBackpointersEnabled = false;
          */
@@ -294,7 +330,7 @@ public class CorfuRuntime {
          * Checkpoint read Batch Size: number of checkpoint addresses to fetch in batch when stream
          * address discovery mechanism relies on address maps instead of follow backpointers;
          */
-        int checkpointReadBatchSize = 5;
+        int checkpointReadBatchSize = 1;
 
         /*
          * Cache Option for local writes.
@@ -307,10 +343,25 @@ public class CorfuRuntime {
 
         // endregion
 
+        /**
+         * Default client name in case the client chooses to remain anonymous.
+         */
+        String clientName = "";
+
+        /**
+         * How often should the local client checkpointer run? 0 disables it completely.
+         */
+        long checkpointTriggerFreqMillis = 0;
+
         /*
          * The period at which the runtime will run garbage collection
          */
         Duration runtimeGCPeriod = Duration.ofMinutes(20);
+        
+        /**
+         * Disable the filewatcher for this runtime
+         */
+        boolean disableFileWatcher = false;
 
         /*
          * The {@link UUID} for the cluster this client is connecting to, or
@@ -385,6 +436,11 @@ public class CorfuRuntime {
          */
         private int streamingSchedulerPollThreshold = 5;
 
+        /**
+         * Allow the caller to specify a different source/build number to identify protobuf upgrades
+         */
+        long sourceCodeVersion = GitRepositoryState.getCorfuSourceCodeVersion();
+
         public static CorfuRuntimeParametersBuilder builder() {
             return new CorfuRuntimeParametersBuilder();
         }
@@ -395,9 +451,11 @@ public class CorfuRuntime {
             private int holeFillRetry = 10;
             private Duration holeFillRetryThreshold = Duration.ofSeconds(1L);
             private Duration holeFillTimeout = Duration.ofSeconds(10);
+            private Duration mvoCacheExpiry = Duration.ofMinutes(10);
             private boolean cacheEntryMetricsDisabled = true;
             private boolean cacheDisabled = false;
-            private long maxCacheEntries;
+            private long maxCacheEntries = 2500;
+            private long maxMvoCacheEntries = 2500;
             private long maxCacheWeight;
             private int cacheConcurrencyLevel = 0;
             private long cacheExpiryTime = Long.MAX_VALUE;
@@ -406,10 +464,13 @@ public class CorfuRuntime {
             private int trimRetry = 2;
             private int checkpointRetries = 5;
             private int checkpointBatchSize = 50;
+            private long maxUncompressedCpEntrySize = 100_000_000;
+            private int restoreBatchSize = 50;
             private int streamBatchSize = 10;
-            private int checkpointReadBatchSize = 5;
+            private int checkpointReadBatchSize = 1;
             private Duration runtimeGCPeriod = Duration.ofMinutes(20);
             private UUID clusterId = null;
+            private boolean disableFileWatcher = false;
             private int systemDownHandlerTriggerLimit = 20;
             private List<NodeLocator> layoutServers = new ArrayList<>();
             private int invalidateRetry = 5;
@@ -420,7 +481,10 @@ public class CorfuRuntime {
             private Duration streamingPollPeriod = Duration.ofMillis(50);
             private int streamingSchedulerPollBatchSize = 25;
             private int streamingSchedulerPollThreshold = 5;
+            private long sourceCodeVersion = GitRepositoryState.getCorfuSourceCodeVersion();
             private boolean cacheWrites = true;
+            private String clientName = "CorfuClient";
+            private long checkpointTriggerFreqMillis = 0;
 
             public CorfuRuntimeParametersBuilder streamingWorkersThreadPoolSize(int streamingWorkersThreadPoolSize) {
                 this.streamingWorkersThreadPoolSize = streamingWorkersThreadPoolSize;
@@ -442,6 +506,11 @@ public class CorfuRuntime {
                 return this;
             }
 
+            public CorfuRuntimeParametersBuilder sourceCodeVersion(long sourceCodeVersion) {
+                this.sourceCodeVersion = sourceCodeVersion;
+                return this;
+            }
+
             public CorfuRuntimeParametersBuilder tlsEnabled(boolean tlsEnabled) {
                 super.tlsEnabled(tlsEnabled);
                 return this;
@@ -459,6 +528,12 @@ public class CorfuRuntime {
 
             public CorfuRuntimeParametersBuilder trustStore(String trustStore) {
                 super.trustStore(trustStore);
+                return this;
+            }
+
+            @Override
+            public CorfuRuntimeParametersBuilder disableCertExpiryCheckFile(Path disableCertExpiryCheckFile) {
+                this.disableCertExpiryCheckFile = disableCertExpiryCheckFile;
                 return this;
             }
 
@@ -582,6 +657,11 @@ public class CorfuRuntime {
                 return this;
             }
 
+            public CorfuRuntimeParameters.CorfuRuntimeParametersBuilder mvoCacheExpiry(Duration mvoCacheExpiry) {
+                this.mvoCacheExpiry = mvoCacheExpiry;
+                return this;
+            }
+
             public CorfuRuntimeParameters.CorfuRuntimeParametersBuilder holeFillTimeout(Duration holeFillTimeout) {
                 this.holeFillTimeout = holeFillTimeout;
                 return this;
@@ -599,6 +679,11 @@ public class CorfuRuntime {
 
             public CorfuRuntimeParameters.CorfuRuntimeParametersBuilder maxCacheEntries(long maxCacheEntries) {
                 this.maxCacheEntries = maxCacheEntries;
+                return this;
+            }
+
+            public CorfuRuntimeParameters.CorfuRuntimeParametersBuilder maxMvoCacheEntries(long maxCacheEntries) {
+                this.maxMvoCacheEntries = maxCacheEntries;
                 return this;
             }
 
@@ -642,6 +727,16 @@ public class CorfuRuntime {
                 return this;
             }
 
+            public CorfuRuntimeParameters.CorfuRuntimeParametersBuilder maxUncompressedCpEntrySize(long maxUncompressedCpEntrySize) {
+                this.maxUncompressedCpEntrySize = maxUncompressedCpEntrySize;
+                return this;
+            }
+
+            public CorfuRuntimeParameters.CorfuRuntimeParametersBuilder restoreBatchSize(int restoreBatchSize) {
+                this.restoreBatchSize = restoreBatchSize;
+                return this;
+            }
+
             public CorfuRuntimeParameters.CorfuRuntimeParametersBuilder streamBatchSize(int streamBatchSize) {
                 this.streamBatchSize = streamBatchSize;
                 return this;
@@ -657,8 +752,24 @@ public class CorfuRuntime {
                 return this;
             }
 
+            public CorfuRuntimeParameters.CorfuRuntimeParametersBuilder clientName(String clientName) {
+                this.clientName = clientName;
+                return this;
+            }
+
+            public CorfuRuntimeParameters.CorfuRuntimeParametersBuilder checkpointTriggerFreqMillis(
+                    long checkpointTriggerFreqMillis) {
+                this.checkpointTriggerFreqMillis = checkpointTriggerFreqMillis;
+                return this;
+            }
+
             public CorfuRuntimeParameters.CorfuRuntimeParametersBuilder runtimeGCPeriod(Duration runtimeGCPeriod) {
                 this.runtimeGCPeriod = runtimeGCPeriod;
+                return this;
+            }
+
+            public CorfuRuntimeParameters.CorfuRuntimeParametersBuilder disableFileWatcher(boolean disableFileWatcher) {
+                this.disableFileWatcher = disableFileWatcher;
                 return this;
             }
 
@@ -704,6 +815,7 @@ public class CorfuRuntime {
                 corfuRuntimeParameters.setKsPasswordFile(ksPasswordFile);
                 corfuRuntimeParameters.setTrustStore(trustStore);
                 corfuRuntimeParameters.setTsPasswordFile(tsPasswordFile);
+                corfuRuntimeParameters.setDisableCertExpiryCheckFile(disableCertExpiryCheckFile);
                 corfuRuntimeParameters.setSaslPlainTextEnabled(saslPlainTextEnabled);
                 corfuRuntimeParameters.setUsernameFile(usernameFile);
                 corfuRuntimeParameters.setPasswordFile(passwordFile);
@@ -728,9 +840,11 @@ public class CorfuRuntime {
                 corfuRuntimeParameters.setHoleFillRetry(holeFillRetry);
                 corfuRuntimeParameters.setHoleFillRetryThreshold(holeFillRetryThreshold);
                 corfuRuntimeParameters.setHoleFillTimeout(holeFillTimeout);
+                corfuRuntimeParameters.setMvoCacheExpiry(mvoCacheExpiry);
                 corfuRuntimeParameters.setCacheEntryMetricsDisabled(cacheEntryMetricsDisabled);
                 corfuRuntimeParameters.setCacheDisabled(cacheDisabled);
                 corfuRuntimeParameters.setMaxCacheEntries(maxCacheEntries);
+                corfuRuntimeParameters.setMaxMvoCacheEntries(maxMvoCacheEntries);
                 corfuRuntimeParameters.setMaxCacheWeight(maxCacheWeight);
                 corfuRuntimeParameters.setCacheConcurrencyLevel(cacheConcurrencyLevel);
                 corfuRuntimeParameters.setCacheExpiryTime(cacheExpiryTime);
@@ -739,10 +853,13 @@ public class CorfuRuntime {
                 corfuRuntimeParameters.setTrimRetry(trimRetry);
                 corfuRuntimeParameters.setCheckpointRetries(checkpointRetries);
                 corfuRuntimeParameters.setCheckpointBatchSize(checkpointBatchSize);
+                corfuRuntimeParameters.setMaxUncompressedCpEntrySize(maxUncompressedCpEntrySize);
+                corfuRuntimeParameters.setRestoreBatchSize(restoreBatchSize);
                 corfuRuntimeParameters.setStreamBatchSize(streamBatchSize);
                 corfuRuntimeParameters.setCheckpointReadBatchSize(checkpointReadBatchSize);
                 corfuRuntimeParameters.setRuntimeGCPeriod(runtimeGCPeriod);
                 corfuRuntimeParameters.setClusterId(clusterId);
+                corfuRuntimeParameters.setDisableFileWatcher(disableFileWatcher);
                 corfuRuntimeParameters.setSystemDownHandlerTriggerLimit(systemDownHandlerTriggerLimit);
                 corfuRuntimeParameters.setLayoutServers(layoutServers);
                 corfuRuntimeParameters.setInvalidateRetry(invalidateRetry);
@@ -753,7 +870,10 @@ public class CorfuRuntime {
                 corfuRuntimeParameters.setStreamingPollPeriod(streamingPollPeriod);
                 corfuRuntimeParameters.setStreamingSchedulerPollBatchSize(streamingSchedulerPollBatchSize);
                 corfuRuntimeParameters.setStreamingSchedulerPollThreshold(streamingSchedulerPollThreshold);
+                corfuRuntimeParameters.setSourceCodeVersion(sourceCodeVersion);
                 corfuRuntimeParameters.setCacheWrites(cacheWrites);
+                corfuRuntimeParameters.setClientName(clientName);
+                corfuRuntimeParameters.setCheckpointTriggerFreqMillis(checkpointTriggerFreqMillis);
                 return corfuRuntimeParameters;
             }
         }
@@ -928,6 +1048,25 @@ public class CorfuRuntime {
     }
 
     /**
+     * Get an optional of the FileWatcher on Keystore file
+     *
+     * @return The Optional of FileWatcher on Keystore file. Empty if keystore is not set in runtime.
+     */
+    private Optional<FileWatcher> initializeSslCertWatcher() {
+
+        // If the filewatcher is disabled for this Runtime, then skip the registration.
+        // This is required for CorfuServer's ManagementAgent's CorfuRuntime, which uses same certs
+        // as the Corfu Server. Duplicate filewatcher is not required as the server already restarts
+        // connections when those certs are changed, leading to client reconnection with the new certs.
+        if (parameters.disableFileWatcher) {
+            return Optional.empty();
+        }
+
+        String keyStorePath = this.parameters.getKeyStore();
+        return FileWatcher.newInstance(keyStorePath, this::reconnect);
+    }
+
+    /**
      * Shuts down the CorfuRuntime.
      * Stops async tasks from fetching the layout.
      * Cannot reuse the runtime once shutdown is called.
@@ -935,6 +1074,10 @@ public class CorfuRuntime {
     public void shutdown() {
         // Stopping async task from fetching layout.
         isShutdown = true;
+
+        // Shutdown the mvoCache sync thread
+        getObjectsView().getMvoCache().shutdown();
+
         TableRegistry tableRegistryObj = tableRegistry.get();
         if (tableRegistryObj != null) {
             tableRegistryObj.shutdown();
@@ -975,10 +1118,20 @@ public class CorfuRuntime {
      * Stop all routers associated with this Corfu Runtime.
      **/
     public void stop(boolean shutdown) {
-        nodeRouterPool.shutdown();
-        if (!shutdown) {
+        if (shutdown) {
+            sslCertWatcher.ifPresent(FileWatcher::close);
+            nodeRouterPool.shutdown();
+        } else {
+            log.info("stop: Re-Initializing nodeRouterPool.");
             nodeRouterPool = new NodeRouterPool(getRouterFunction);
         }
+    }
+
+    /**
+     * Reestablish the netty connections to corfu servers
+     */
+    private void reconnect() {
+        nodeRouterPool.reconnect();
     }
 
     /**
@@ -1002,6 +1155,8 @@ public class CorfuRuntime {
 
     /**
      * Parse a configuration string and get a CorfuRuntime.
+     * Both Pure IPv6 and Pure IPv4 addresses are supported.
+     *
      *
      * @param configurationString The configuration string to parse.
      * @return A CorfuRuntime Configured based on the configuration string.
@@ -1010,7 +1165,7 @@ public class CorfuRuntime {
         // Parse comma sep. list.
         bootstrapLayoutServers = Pattern.compile(",")
                 .splitAsStream(configurationString)
-                .map(String::trim)
+                .map(address -> getVersionFormattedEndpointURL(address.trim()))
                 .collect(Collectors.toList());
         log.info("Bootstrap Layout Servers {}", bootstrapLayoutServers);
         layoutServers = new ArrayList<>(bootstrapLayoutServers);
@@ -1067,7 +1222,8 @@ public class CorfuRuntime {
      * @param layout The layout to check.
      * @throws WrongClusterException If the layout belongs to the wrong cluster.
      */
-    private void checkClusterId(@Nonnull Layout layout) {
+    @VisibleForTesting
+    public void checkClusterId(@Nonnull Layout layout) {
         // We haven't adopted a clusterId yet.
         if (clusterId == null) {
             clusterId = layout.getClusterId();
@@ -1208,6 +1364,12 @@ public class CorfuRuntime {
 
         log.info("connect: runtime parameters {}", getParameters());
 
+        // Start file watcher on Ssl certs
+        if (!sslCertWatcher.isPresent()) {
+            log.info("connect: Initializing sslCertWatcher.");
+            sslCertWatcher = initializeSslCertWatcher();
+        }
+
         if (layout == null) {
             log.info("Connecting to Corfu server instance, layout servers={}", bootstrapLayoutServers);
             // Fetch the current layout and save the future.
@@ -1285,6 +1447,7 @@ public class CorfuRuntime {
         parameters.trustStore = trustStore;
         parameters.tsPasswordFile = tsPasswordFile;
         parameters.tlsEnabled = true;
+
         return this;
     }
 

@@ -5,10 +5,12 @@ import lombok.Getter;
 import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
 import org.corfudb.infrastructure.LogReplicationRuntimeParameters;
-import org.corfudb.infrastructure.logreplication.proto.LogReplicationMetadata.SyncStatus;
 import org.corfudb.infrastructure.logreplication.replication.receive.LogReplicationMetadataManager;
 import org.corfudb.infrastructure.logreplication.runtime.CorfuLogReplicationRuntime;
+import org.corfudb.infrastructure.logreplication.utils.LogReplicationConfigManager;
 import org.corfudb.runtime.CorfuRuntime;
+import org.corfudb.runtime.exceptions.TransactionAbortedException;
+import org.corfudb.runtime.exceptions.unrecoverable.UnrecoverableCorfuInterruptedError;
 import org.corfudb.util.retry.IRetry;
 import org.corfudb.util.retry.IntervalRetry;
 import org.corfudb.util.retry.RetryNeededException;
@@ -42,17 +44,20 @@ public class CorfuReplicationManager {
 
     private final String pluginFilePath;
 
+    private final LogReplicationConfigManager replicationConfigManager;
+
     /**
      * Constructor
      */
     public CorfuReplicationManager(LogReplicationContext context, NodeDescriptor localNodeDescriptor,
                                    LogReplicationMetadataManager metadataManager, String pluginFilePath,
-                                   CorfuRuntime corfuRuntime) {
+                                   CorfuRuntime corfuRuntime, LogReplicationConfigManager replicationConfigManager) {
         this.context = context;
         this.metadataManager = metadataManager;
         this.pluginFilePath = pluginFilePath;
         this.corfuRuntime = corfuRuntime;
         this.localNodeDescriptor = localNodeDescriptor;
+        this.replicationConfigManager = replicationConfigManager;
     }
 
     /**
@@ -132,8 +137,10 @@ public class CorfuReplicationManager {
                             .ksPasswordFile(corfuRuntime.getParameters().getKsPasswordFile())
                             .trustStore(corfuRuntime.getParameters().getTrustStore())
                             .tsPasswordFile(corfuRuntime.getParameters().getTsPasswordFile())
+                            .maxWriteSize(corfuRuntime.getParameters().getMaxWriteSize())
                             .build();
-                    CorfuLogReplicationRuntime replicationRuntime = new CorfuLogReplicationRuntime(parameters, metadataManager);
+                    CorfuLogReplicationRuntime replicationRuntime = new CorfuLogReplicationRuntime(parameters,
+                            metadataManager, replicationConfigManager);
                     replicationRuntime.start();
                     runtimeToRemoteCluster.put(remoteCluster.getClusterId(), replicationRuntime);
                 } catch (Exception e) {
@@ -160,6 +167,26 @@ public class CorfuReplicationManager {
             runtimeToRemoteCluster.remove(remoteClusterId);
         } else {
             log.warn("Runtime not found to remote cluster {}", remoteClusterId);
+        }
+    }
+
+    private void removeClusterInfoFromStatusTable(String clusterId) {
+        try {
+            IRetry.build(IntervalRetry.class, () -> {
+                try {
+                    metadataManager.removeFromStatusTable(clusterId);
+                } catch (TransactionAbortedException tae) {
+                    log.error("Error while attempting to remove clusterInfo from LR status tables", tae);
+                    throw new RetryNeededException();
+                }
+
+                log.debug("removeClusterInfoFromStatusTable succeeds, removed clusterID {}", clusterId);
+
+                return null;
+            }).run();
+        } catch (InterruptedException e) {
+            log.error("Unrecoverable exception when attempting to removeClusterInfoFromStatusTable", e);
+            throw new UnrecoverableCorfuInterruptedError(e);
         }
     }
 
@@ -192,6 +219,7 @@ public class CorfuReplicationManager {
         // Remove standbys that are not in the new config
         for (String clusterId : standbysToRemove) {
             stopLogReplicationRuntime(clusterId);
+            removeClusterInfoFromStatusTable(clusterId);
             topology.removeStandbyCluster(clusterId);
         }
 
@@ -202,6 +230,8 @@ public class CorfuReplicationManager {
                 topology.addStandbyCluster(clusterInfo);
                 startLogReplicationRuntime(clusterInfo);
             }
+            // Initialize default replication status values for the new standby
+            metadataManager.initializeReplicationStatusTable(clusterId);
         }
 
         // The connection id or other transportation plugin's info could've changed for
@@ -226,17 +256,5 @@ public class CorfuReplicationManager {
             standbyRuntime.getSourceManager().stopLogReplication();
             standbyRuntime.getSourceManager().startForcedSnapshotSync(event.getEventId());
         }
-    }
-
-    /**
-     * Update Replication Status as NOT_STARTED.
-     * Should be called only once in an active lifecycle.
-     */
-    public void updateStatusAsNotStarted() {
-        runtimeToRemoteCluster.values().forEach(corfuLogReplicationRuntime ->
-                corfuLogReplicationRuntime
-                        .getSourceManager()
-                        .getAckReader()
-                        .markSyncStatus(SyncStatus.NOT_STARTED));
     }
 }

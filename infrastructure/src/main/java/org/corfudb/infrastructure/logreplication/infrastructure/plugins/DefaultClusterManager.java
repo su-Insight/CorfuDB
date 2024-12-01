@@ -34,6 +34,8 @@ import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.LinkedBlockingQueue;
 
+import static org.corfudb.common.util.URLUtils.getVersionFormattedHostAddress;
+
 /**
  * This class extends CorfuReplicationClusterManagerAdapter, provides topology config API
  * for integration tests. The initial topology config should be valid, which means it has only
@@ -41,7 +43,7 @@ import java.util.concurrent.LinkedBlockingQueue;
  */
 @Slf4j
 public class DefaultClusterManager extends CorfuReplicationClusterManagerBaseAdapter {
-    public static final String CONFIG_FILE_PATH = "src/test/resources/corfu_replication_config.properties";
+    public static final String CONFIG_FILE_PATH = "./test/src/test/resources/corfu_replication_config.properties";
     private static final String DEFAULT_ACTIVE_CLUSTER_NAME = "primary_site";
     private static final String DEFAULT_STANDBY_CLUSTER_NAME = "standby_site";
 
@@ -334,7 +336,7 @@ public class DefaultClusterManager extends CorfuReplicationClusterManagerBaseAda
                 currentActive.getClusterId(), ClusterRole.ACTIVE, BACKUP_CORFU_PORT));
 
         NodeDescriptor backupNode = new NodeDescriptor(
-                DefaultClusterConfig.getDefaultHost(),
+                getVersionFormattedHostAddress(DefaultClusterConfig.getDefaultHost()),
                 DefaultClusterConfig.getBackupLogReplicationPort(),
                 BACKUP_CLUSTER_NAME,
                 DefaultClusterConfig.getBackupNodesUuid().get(0),

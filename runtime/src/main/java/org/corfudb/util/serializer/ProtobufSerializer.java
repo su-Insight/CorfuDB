@@ -2,22 +2,20 @@ package org.corfudb.util.serializer;
 
 import com.google.protobuf.Any;
 import com.google.protobuf.Message;
-
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufInputStream;
 import io.netty.buffer.ByteBufOutputStream;
+import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
+import org.corfudb.runtime.CorfuRuntime;
+import org.corfudb.runtime.CorfuStoreMetadata.Record;
+import org.corfudb.runtime.collections.CorfuRecord;
+import org.corfudb.runtime.exceptions.SerializerException;
 
 import java.io.IOException;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentMap;
-
-import lombok.Getter;
-import org.corfudb.runtime.CorfuRuntime;
-import org.corfudb.runtime.CorfuStoreMetadata.Record;
-import org.corfudb.runtime.collections.CorfuRecord;
-import lombok.extern.slf4j.Slf4j;
-import org.corfudb.runtime.exceptions.SerializerException;
 
 /**
  * The Protobuf serializer is the main component that allows CorfuStore to use Protobufs to
@@ -90,12 +88,16 @@ public class ProtobufSerializer implements ISerializer {
             Record record = Record.parseFrom(data);
             Any payload = record.getPayload();
             if (!classMap.containsKey(payload.getTypeUrl())) {
-                log.error("Deserialization error: Encountered a log update for this class "+payload.getTypeUrl()
-                        +" but its corresponding class type cannot be found in in-memory type map. Dumping map..\n");
+                log.error(String.format(
+                        "Deserialization error: Un-Opened or unknown key/value type [%s]",
+                        payload.getTypeUrl()));
+                log.error("Dumping all known types in map for debugging\n");
                 for (String entry: classMap.keySet()) {
-                    log.error(entry + "=>" + classMap.get(entry));
+                    log.error(String.format("[%s] -> [%s]", entry, classMap.get(entry)));
                 }
-                throw new SerializerException(payload.getTypeUrl()+" not in map!");
+                throw new SerializerException(String.format(
+                        "Value [%s] unknown. Maybe openTable() has wrong type?",
+                        payload.getTypeUrl()));
             }
             Message value = payload.unpack(classMap.get(payload.getTypeUrl()));
 
@@ -105,7 +107,19 @@ public class ProtobufSerializer implements ISerializer {
                 Message metadata = null;
                 if (record.hasMetadata()) {
                     Any anyMetadata = record.getMetadata();
-                    metadata = anyMetadata.unpack(classMap.get(anyMetadata.getTypeUrl()));
+                    Class<? extends Message> metadataClass = classMap.get(anyMetadata.getTypeUrl());
+                    if (metadataClass == null) {
+                        log.error(String.format("Deserialization error: Unknown metadata type [%s]",
+                                anyMetadata.getTypeUrl()));
+                        log.error("Dumping all known types in map for debugging\n");
+                        for (String entry: classMap.keySet()) {
+                            log.error(String.format("[%s] -> [%s]", entry, classMap.get(entry)));
+                        }
+                        throw new SerializerException(String.format(
+                                "Metadata [%s] unknown. Maybe openTable() has wrong metadata type?",
+                                anyMetadata.getTypeUrl()));
+                    }
+                    metadata = anyMetadata.unpack(metadataClass);
                 }
                 return new CorfuRecord(value, metadata);
             }

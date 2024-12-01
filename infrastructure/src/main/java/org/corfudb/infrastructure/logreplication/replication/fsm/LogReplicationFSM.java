@@ -18,11 +18,13 @@ import org.corfudb.infrastructure.logreplication.replication.send.logreader.Read
 import org.corfudb.infrastructure.logreplication.replication.send.logreader.SnapshotReader;
 import org.corfudb.infrastructure.logreplication.replication.send.logreader.StreamsLogEntryReader;
 import org.corfudb.infrastructure.logreplication.replication.send.logreader.StreamsSnapshotReader;
+import org.corfudb.infrastructure.logreplication.utils.LogReplicationConfigManager;
 import org.corfudb.runtime.CorfuRuntime;
 import org.corfudb.runtime.view.Address;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -171,6 +173,11 @@ public class LogReplicationFSM {
     private final SnapshotReader snapshotReader;
 
     /**
+     * Used for checking if LR is in upgrading path
+     */
+    private final LogReplicationConfigManager tableManagerPlugin;
+
+    /**
      * Version on which snapshot sync is based on.
      */
     @Getter
@@ -193,6 +200,8 @@ public class LogReplicationFSM {
     /**
      * Snapshot Sender (send snapshot cut to remote cluster)
      */
+    @Getter
+    @VisibleForTesting
     private final SnapshotSender snapshotSender;
 
     /**
@@ -213,10 +222,11 @@ public class LogReplicationFSM {
      * @param workers FSM executor service for state tasks
      */
     public LogReplicationFSM(CorfuRuntime runtime, LogReplicationConfig config, ClusterDescriptor remoteCluster, DataSender dataSender,
-                             ReadProcessor readProcessor, ExecutorService workers, LogReplicationAckReader ackReader) {
+                             ReadProcessor readProcessor, ExecutorService workers, LogReplicationAckReader ackReader,
+                             LogReplicationConfigManager tableManagerPlugin) {
         // Use stream-based readers for snapshot and log entry sync reads
         this(runtime, new StreamsSnapshotReader(runtime, config), dataSender,
-                new StreamsLogEntryReader(runtime, config), readProcessor, config, remoteCluster, workers, ackReader);
+                new StreamsLogEntryReader(runtime, config), readProcessor, config, remoteCluster, workers, ackReader, tableManagerPlugin);
     }
 
     /**
@@ -234,11 +244,13 @@ public class LogReplicationFSM {
     @VisibleForTesting
     public LogReplicationFSM(CorfuRuntime runtime, SnapshotReader snapshotReader, DataSender dataSender,
                              LogEntryReader logEntryReader, ReadProcessor readProcessor, LogReplicationConfig config,
-                             ClusterDescriptor remoteCluster, ExecutorService workers, LogReplicationAckReader ackReader) {
+                             ClusterDescriptor remoteCluster, ExecutorService workers, LogReplicationAckReader ackReader,
+                             LogReplicationConfigManager tableManagerPlugin) {
 
         this.snapshotReader = snapshotReader;
         this.logEntryReader = logEntryReader;
         this.ackReader = ackReader;
+        this.tableManagerPlugin = tableManagerPlugin;
 
         // Create transmitters to be used by the the sync states (Snapshot and LogEntry) to read and send data
         // through the callbacks provided by the application
@@ -271,7 +283,7 @@ public class LogReplicationFSM {
          */
         states.put(LogReplicationStateType.INITIALIZED, new InitializedState(this));
         states.put(LogReplicationStateType.IN_SNAPSHOT_SYNC, new InSnapshotSyncState(this, snapshotSender));
-        states.put(LogReplicationStateType.WAIT_SNAPSHOT_APPLY, new WaitSnapshotApplyState(this, dataSender));
+        states.put(LogReplicationStateType.WAIT_SNAPSHOT_APPLY, new WaitSnapshotApplyState(this, dataSender, tableManagerPlugin));
         states.put(LogReplicationStateType.IN_LOG_ENTRY_SYNC, new InLogEntrySyncState(this, logEntrySender));
         states.put(LogReplicationStateType.ERROR, new ErrorState(this));
     }
@@ -371,5 +383,9 @@ public class LogReplicationFSM {
         this.ackReader.shutdown();
         this.logReplicationFSMConsumer.shutdown();
         this.logReplicationFSMWorkers.shutdown();
+    }
+
+    public boolean isValidTransition(UUID currentSyncId, UUID newSyncID) {
+        return currentSyncId.equals(newSyncID);
     }
 }

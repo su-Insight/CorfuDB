@@ -6,7 +6,9 @@ import ch.qos.logback.classic.LoggerContext;
 import ch.qos.logback.core.joran.spi.JoranException;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
+import org.corfudb.common.config.ConfigParamsHelper;
 import org.corfudb.common.metrics.micrometer.MeterRegistryProvider;
+import org.corfudb.common.util.URLUtils.NetworkInterfaceVersion;
 import org.corfudb.infrastructure.ServerContext;
 import org.corfudb.infrastructure.logreplication.infrastructure.plugins.CorfuReplicationClusterManagerAdapter;
 import org.corfudb.infrastructure.logreplication.infrastructure.plugins.LogReplicationPluginConfig;
@@ -47,9 +49,12 @@ public class CorfuInterClusterReplicationServer implements Runnable {
                     + "\n"
                     + "Usage:\n"
                     + "\tlog_replication_server (-l <path>|-m) [-nsN] [-a <address>|-q <interface-name>] "
+                    + "[--network-interface-version=<interface-version>] "
                     + "[--snapshot-batch=<batch-size>] "
                     + "[--max-replication-data-message-size=<msg-size>] "
+                    + "[--max-replication-write-size=<max-replication-write-size>] "
                     + "[--lock-lease=<lease-duration>]"
+                    + "[--max-snapshot-entries-applied=<max-snapshot-entries-applied>]"
                     + "[-c <ratio>] [-d <level>] [-p <seconds>] "
                     + "[--lrCacheSize=<cache-num-entries>]"
                     + "[--plugin=<plugin-config-file-path>]"
@@ -60,6 +65,8 @@ public class CorfuInterClusterReplicationServer implements Runnable {
                     + "[-b] [-g -o <username_file> -j <password_file>] "
                     + "[-k <seqcache>] [-T <threads>] [-B <size>] [-i <channel-implementation>] "
                     + "[-H <seconds>] [-I <cluster-id>] [-x <ciphers>] [-z <tls-protocols>]] "
+                    + "[--disable-cert-expiry-check-file=<file_path>] [--wait-before-apply-ms=<wait_before_apply_ms>] "
+                    + "[--wait-in-negotiating-state-ms=<wait_in_negotiating_state_ms>] "
                     + "[--metrics]"
                     + "[-P <prefix>] [-R <retention>] <port>\n"
                     + "\n"
@@ -84,6 +91,8 @@ public class CorfuInterClusterReplicationServer implements Runnable {
                     + "advertise to external clients.\n"
                     + " -q <interface-name>, --network-interface=<interface-name>                "
                     + "              The name of the network interface.\n"
+                    + " --network-interface-version=<interface-version>                "
+                    + "              The version of the network interface, IPv4 or IPv6(default).\n"
                     + " -i <channel-implementation>, --implementation <channel-implementation>   "
                     + "              The type of channel to use (auto, nio, epoll, kqueue)"
                     + "[default: nio].\n"
@@ -120,8 +129,6 @@ public class CorfuInterClusterReplicationServer implements Runnable {
                     + "              Set the logging level, valid levels are: \n"
                     + "                                                                          "
                     + "              ALL,ERROR,WARN,INFO,DEBUG,TRACE,OFF [default: INFO].\n"
-                    + " -n, --no-verify                                                          "
-                    + "              Disable checksum computation and verification.\n"
                     + " -N, --no-sync                                                            "
                     + "              Disable syncing writes to secondary storage.\n"
                     + " -e, --enable-tls                                                         "
@@ -149,11 +156,14 @@ public class CorfuInterClusterReplicationServer implements Runnable {
                     + " -x <ciphers>, --tls-ciphers=<ciphers>                                    "
                     + "              Comma separated list of TLS ciphers to use.\n"
                     + "                                                                          "
-                    + "              [default: TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256].\n"
+                    + "              [default: " + ConfigParamsHelper.getTlsCiphersCSV() + "].\n"
                     + " -z <tls-protocols>, --tls-protocols=<tls-protocols>                      "
                     + "              Comma separated list of TLS protocols to use.\n"
                     + "                                                                          "
                     + "              [default: TLSv1.1,TLSv1.2].\n"
+                    + " --disable-cert-expiry-check-file=<file_path>                             "
+                    + "              Path to Disable Cert Expiry Check File. If this file is     "
+                    + "              present, the certificate expiry checks are disabled.\n      "
                     + " --base-server-threads=<base_server_threads>                              "
                     + "              Number of threads dedicated for the base server [default: 1].\n"
                     + " --log-size-quota-percentage=<max_log_size_percentage>                    "
@@ -174,14 +184,24 @@ public class CorfuInterClusterReplicationServer implements Runnable {
                     + " --lrCacheSize=<cache-num-entries>"
                     + "              Cache max number of entries.\n                              "
                     + " --max-replication-data-message-size=<msg-size>                           "
-                    + "              The max size of replication data message in bytes.\n   "
+                    + "              Max size of replication data message in bytes. \n   "
+                    + " --max-replication-write-size=<max-replication-write-size>"
+                    + "              Max size written by the SINK in a single corfu transaction.  Integer.MAX_VALUE by default\n "
                     + "                                                                          "
                     + " --lock-lease=<lease-duration>                                            "
                     + "              Lock lease duration in seconds\n                            "
+                    + " --max-snapshot-entries-applied=<max-snapshot-entries-applied>            "
+                    + "              Max number of entries applied in a snapshot transaction.  50 by default."
+                    + "              For special tables only\n.                                  "
                     + " -h, --help                                                               "
                     + "              Show this screen\n"
                     + " --version                                                                "
-                    + "              Show version\n";
+                    + "              Show version\n"
+                    + " --wait-before-apply-ms=<wait_before_apply_ms>                                  "
+                    + "             Duration in ms to wait before before starting the apply phase.  For Testing Only."
+                    + " [default: 0] \n"
+                    + " --wait-in-negotiating-state-ms=<wait_in_negotiating_state_ms>            "
+                    + "             Duration in ms to wait in the Negotiating State.  For Testing Only. [default: 0] \n";
 
     // Active Corfu Server Node.
     private volatile CorfuInterClusterReplicationServerNode activeServer;
@@ -198,6 +218,11 @@ public class CorfuInterClusterReplicationServer implements Runnable {
     private static final Duration DEFAULT_METRICS_LOGGING_INTERVAL_DURATION = Duration.ofMinutes(1);
 
     private static final String DEFAULT_METRICS_LOGGER_NAME = "LogReplicationMetrics";
+
+    // Declaring strings to avoid code duplication code analysis error
+    private static final String ADDRESS_PARAM = "--address";
+    private static final String NETWORK_INTERFACE_VERSION_PARAM = "--network-interface-version";
+
 
     // Getter for testing
     @Getter
@@ -282,18 +307,33 @@ public class CorfuInterClusterReplicationServer implements Runnable {
         // Bind to all interfaces only if no address or interface specified by the user.
         // Fetch the address if given a network interface.
         if (opts.get("--network-interface") != null) {
-            opts.put("--address", getAddressFromInterfaceName((String) opts.get("--network-interface")));
+            opts.put(
+                    ADDRESS_PARAM,
+                    getAddressFromInterfaceName(
+                            (String) opts.get("--network-interface"),
+                            (opts.get(NETWORK_INTERFACE_VERSION_PARAM) != null) ?
+                                    NetworkInterfaceVersion.valueOf(((String) opts.get(NETWORK_INTERFACE_VERSION_PARAM)).toUpperCase()):
+                                    NetworkInterfaceVersion.IPV6 // Default is IPV6
+                    )
+            );
             opts.put("--bind-to-all-interfaces", false);
-        } else if (opts.get("--address") == null) {
-            // Default the address to localhost and set the bind to all interfaces flag to true,
-            // if the address and interface is not specified.
+        } else if (opts.get(ADDRESS_PARAM) == null) {
+            // If the address and interface is not specified,
+            // pick an address from eth0 interface and set the bind to all interfaces flag to true.
             opts.put("--bind-to-all-interfaces", true);
-            opts.put("--address", "localhost");
+            opts.put(ADDRESS_PARAM,
+                    getAddressFromInterfaceName(
+                            "eth0",
+                            (opts.get(NETWORK_INTERFACE_VERSION_PARAM) != null) ?
+                                    NetworkInterfaceVersion.valueOf(((String) opts.get(NETWORK_INTERFACE_VERSION_PARAM)).toUpperCase()):
+                                    NetworkInterfaceVersion.IPV6 // Default is IPV6
+                    )
+            );
         } else {
             // Address is specified by the user.
             opts.put("--bind-to-all-interfaces", false);
         }
-
+        log.info("Configured Corfu Replication Server address: {}", opts.get(ADDRESS_PARAM));
         return new ServerContext(opts);
     }
 

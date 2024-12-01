@@ -1,20 +1,23 @@
 package org.corfudb.runtime.object.transactions;
 
+import lombok.extern.slf4j.Slf4j;
+import org.corfudb.protocols.logprotocol.SMREntry;
+import org.corfudb.protocols.wireprotocol.TxResolutionInfo;
+import org.corfudb.runtime.CorfuOptions;
+import org.corfudb.runtime.exceptions.AbortCause;
+import org.corfudb.runtime.exceptions.AppendException;
+import org.corfudb.runtime.exceptions.TransactionAbortedException;
+import org.corfudb.runtime.object.ConsistencyView;
+import org.corfudb.runtime.object.ICorfuSMRAccess;
+import org.corfudb.runtime.object.MVOCorfuCompileProxy;
+import org.corfudb.runtime.object.SnapshotGenerator;
+
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 
-import lombok.extern.slf4j.Slf4j;
-import org.corfudb.protocols.logprotocol.SMREntry;
-import org.corfudb.protocols.wireprotocol.Token;
-import org.corfudb.protocols.wireprotocol.TxResolutionInfo;
-import org.corfudb.runtime.exceptions.AbortCause;
-import org.corfudb.runtime.exceptions.AppendException;
-import org.corfudb.runtime.exceptions.TransactionAbortedException;
-import org.corfudb.runtime.object.ICorfuSMR;
-import org.corfudb.runtime.object.ICorfuSMRAccess;
-import org.corfudb.runtime.object.ICorfuSMRProxyInternal;
+import static org.corfudb.runtime.CorfuOptions.ConsistencyModel.READ_COMMITTED;
 
 
 /** A Corfu optimistic transaction context.
@@ -65,88 +68,22 @@ public class OptimisticTransactionalContext extends AbstractTransactionalContext
      * {@inheritDoc}
      */
     @Override
-    public <R, T extends ICorfuSMR<T>> R access(ICorfuSMRProxyInternal<T> proxy,
-                                                ICorfuSMRAccess<R, T> accessFunction,
-                                                Object[] conflictObject) {
-        log.debug("Access[{},{}] conflictObj={}", this, proxy, conflictObject);
-        // First, we add this access to the read set
-        addToReadSet(proxy, conflictObject);
+    public <R, S extends SnapshotGenerator<S> & ConsistencyView> R access(
+            MVOCorfuCompileProxy<S> proxy, ICorfuSMRAccess<R, S> accessFunction, Object[] conflictObject) {
+        long startAccessTime = System.nanoTime();
+        try {
+            log.trace("Access[{},{}] conflictObj={}", this, proxy, conflictObject);
 
-        // Next, we sync the object, which will bring the object
-        // to the correct version, reflecting any optimistic
-        // updates.
-        // Get snapshot timestamp in advance so it is not performed under the VLO lock
-        long ts = getSnapshotTimestamp().getSequence();
-        return proxy
-                .getUnderlyingObject()
-                .access(o -> {
-                            WriteSetSMRStream stream = o.getOptimisticStreamUnsafe();
+            // First, we add this access to the read set
+            addToReadSet(proxy, conflictObject);
 
-                            // Obtain the stream position as when transaction context last
-                            // remembered it.
-                            long streamReadPosition = knownStreamsPosition.getOrDefault(proxy.getStreamID(), ts);
-
-                            return (
-                                    (stream == null || stream.isStreamCurrentContextThreadCurrentContext())
-                                    && (stream != null && getWriteSetEntrySize(proxy.getStreamID()) == stream.pos() + 1
-                                       || (getWriteSetEntrySize(proxy.getStreamID()) == 0 /* No updates. */
-                                          && o.getVersionUnsafe() == streamReadPosition) /* Match timestamp. */
-                                    )
-                            );
-                        },
-                        o -> {
-                            // inside syncObjectUnsafe, depending on the object
-                            // version, we may need to undo or redo
-                            // committed changes, or apply forward committed changes.
-                            syncWithRetryUnsafe(o, getSnapshotTimestamp(), proxy,
-                                    o::setUncommittedChanges);
-                        },
-                        accessFunction::access,
-                        version -> updateKnownStreamPosition(proxy.getStreamID(), version)
-        );
-    }
-
-    /**
-     * if a Corfu object's method is an Accessor-Mutator, then although the mutation is delayed,
-     * it needs to obtain the result by invoking getUpcallResult() on the optimistic stream.
-     *
-     * <p>This is similar to the second stage of access(), accept working
-     * on the optimistic stream instead of the
-     * underlying stream.- grabs the write-lock on the proxy.
-     * - uses proxy.setAsOptimisticStream in order to set itself as the proxy optimistic context,
-     *   including rolling-back current optimistic changes, if any.
-     * - uses proxy.syncObjectUnsafe to bring the proxy to the desired version,
-     *   which includes applying optimistic updates of the current
-     *  transactional context.
-     *
-     * {@inheritDoc}
-     */
-    @Override
-    public <T extends ICorfuSMR<T>> Object getUpcallResult(ICorfuSMRProxyInternal<T> proxy,
-                                                           long timestamp, Object[] conflictObject) {
-        // Getting an upcall result adds the object to the conflict set.
-        addToReadSet(proxy, conflictObject);
-
-        // if we have a result, return it.
-        SMREntry wrapper = getWriteSetEntryList(proxy.getStreamID()).get((int)timestamp);
-        if (wrapper != null && wrapper.isHaveUpcallResult()) {
-            return wrapper.getUpcallResult();
+            // Get snapshot timestamp in advance, so it is not performed under the VLO lock
+            long ts = getSnapshotTimestamp().getSequence();
+            return getAndCacheSnapshotProxy(proxy, ts)
+                    .access(accessFunction, version -> updateKnownStreamPosition(proxy, version));
+        } finally {
+            dbNanoTime += (System.nanoTime() - startAccessTime);
         }
-        // Otherwise, we need to sync the object
-        // Get snapshot timestamp in advance so it is not performed under the VLO lock
-        Token ts = getSnapshotTimestamp();
-        return proxy.getUnderlyingObject().update(o -> {
-            log.trace("Upcall[{}] {} Sync'd", this,  timestamp);
-            syncWithRetryUnsafe(o, ts, proxy, o::setUncommittedChanges);
-            SMREntry wrapper2 = getWriteSetEntryList(proxy.getStreamID()).get((int)timestamp);
-            if (wrapper2 != null && wrapper2.isHaveUpcallResult()) {
-                return wrapper2.getUpcallResult();
-            }
-            // If we still don't have the upcall, this must be a bug.
-            throw new RuntimeException("Tried to get upcall during a transaction but"
-                    + " we don't have it even after an optimistic sync (asked for " + timestamp
-                    + " we have 0-" + (getWriteSetEntryList(proxy.getStreamID()).size() - 1) + ")");
-        });
     }
 
     /** Logs an update. In the case of an optimistic transaction, this update
@@ -157,19 +94,26 @@ public class OptimisticTransactionalContext extends AbstractTransactionalContext
      *
      * @param proxy         The proxy making the request.
      * @param updateEntry   The timestamp of the request.
-     * @param <T>           The type of the proxy.
      * @return              The "address" that the update was written to.
      */
     @Override
-    public <T extends ICorfuSMR<T>> long logUpdate(ICorfuSMRProxyInternal<T> proxy,
-                                                   SMREntry updateEntry,
-                                                   Object[] conflictObjects) {
-        log.trace("LogUpdate[{},{}] {} ({}) conflictObj={}",
-                this, proxy, updateEntry.getSMRMethod(),
-                updateEntry.getSMRArguments(), conflictObjects);
+    public long logUpdate(
+            MVOCorfuCompileProxy<?> proxy, SMREntry updateEntry, Object[] conflictObjects) {
+        long startLogUpdateTime = System.nanoTime();
 
-        return addToWriteSet(proxy, updateEntry, conflictObjects);
+        try {
+            log.trace("LogUpdate[{},{}] {} ({}) conflictObj={}",
+                    this, proxy, updateEntry.getSMRMethod(),
+                    updateEntry.getSMRArguments(), conflictObjects);
+
+            getAndCacheSnapshotProxy(proxy, getSnapshotTimestamp().getSequence()).logUpdate(updateEntry);
+            return addToWriteSet(proxy, updateEntry, conflictObjects);
+        } finally {
+            dbNanoTime += (System.nanoTime() - startLogUpdateTime);
+        }
     }
+
+    // TODO: below logUpdate methods.
 
     @Override
     public void logUpdate(UUID streamId, SMREntry updateEntry) {
@@ -192,7 +136,6 @@ public class OptimisticTransactionalContext extends AbstractTransactionalContext
      *
      * @param tc The transaction to merge.
      */
-    @SuppressWarnings("unchecked")
     public void addTransaction(AbstractTransactionalContext tc) {
         log.trace("Merge[{}] adding {}", this, tc);
         // merge the conflict maps
@@ -213,10 +156,8 @@ public class OptimisticTransactionalContext extends AbstractTransactionalContext
      * @throws TransactionAbortedException  If the transaction was aborted.
      */
     @Override
-    @SuppressWarnings("unchecked")
     public long commitTransaction() throws TransactionAbortedException {
-        log.debug("TX[{}] request optimistic commit", this);
-
+        log.trace("TX[{}] request optimistic commit", this);
         return getConflictSetAndCommit(getReadSetInfo());
     }
 
@@ -236,14 +177,22 @@ public class OptimisticTransactionalContext extends AbstractTransactionalContext
         }
 
         // If the write set is empty, this is a read-only transaction.
-        // Return the max address of all accessed streams, this will provide a safe token of the
+        // If the transaction has only read non-monotonic objects, then return the
+        // max address of all accessed streams, this will provide a safe token of the
         // transaction's snapshot. Notice that, providing the snapshot of the tx (vs. max address)
         // can lead to data loss, as a sequencer reboot might incur in sequence regression.
         // This timestamp is aimed to provide clients with a secure point for delta/streaming
         // subscription, the later could lead to data loss scenarios.
+        // If the transaction has read monotonic objects, we instead return the min address
+        // of all accessed streams. Although this avoids data loss, clients subscribing at
+        // this point for delta/streaming may observe duplicate data.
         if (getWriteSetInfo().getWriteSet().getEntryMap().isEmpty()) {
             log.trace("Commit[{}] Read-only commit (no write)", this);
-            return getMaxAddressRead();
+            if (accessedReadCommittedObject) {
+                return getMinAddressRead();
+            } else {
+                return getMaxAddressRead();
+            }
         }
 
         Set<UUID> affectedStreamsIds = new HashSet<>(getWriteSetInfo()

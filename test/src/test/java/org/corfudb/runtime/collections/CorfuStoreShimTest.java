@@ -8,52 +8,76 @@ import com.google.protobuf.Message;
 import lombok.extern.slf4j.Slf4j;
 import org.corfudb.protocols.wireprotocol.LogData;
 import org.corfudb.protocols.wireprotocol.StreamAddressRange;
+import org.corfudb.protocols.wireprotocol.Token;
 import org.corfudb.protocols.wireprotocol.TokenResponse;
 import org.corfudb.runtime.CorfuOptions;
+import org.corfudb.runtime.CorfuOptions.PersistenceOptions;
 import org.corfudb.runtime.CorfuRuntime;
 import org.corfudb.runtime.CorfuStoreMetadata;
 import org.corfudb.runtime.CorfuStoreMetadata.ProtobufFileDescriptor;
 import org.corfudb.runtime.CorfuStoreMetadata.ProtobufFileName;
 import org.corfudb.runtime.ExampleSchemas;
+import org.corfudb.runtime.ExampleSchemas.ManagedMetadata;
 import org.corfudb.runtime.LogReplication.LogReplicationEntryMetadataMsg;
 import org.corfudb.runtime.Queue;
 import org.corfudb.runtime.exceptions.StaleRevisionUpdateException;
+import org.corfudb.runtime.exceptions.TransactionAbortedException;
+import org.corfudb.runtime.object.RocksDbStore;
+import org.corfudb.runtime.object.VersionedObjectIdentifier;
 import org.corfudb.runtime.object.transactions.TransactionType;
 import org.corfudb.runtime.object.transactions.TransactionalContext;
 import org.corfudb.runtime.proto.RpcCommon;
 import org.corfudb.runtime.proto.RpcCommon.UuidMsg;
 import org.corfudb.runtime.view.AbstractViewTest;
-import org.corfudb.runtime.ExampleSchemas.ManagedMetadata;
 import org.corfudb.runtime.view.Address;
-import org.corfudb.runtime.view.ObjectsView;
+import org.corfudb.runtime.view.ObjectsView.ObjectID;
 import org.corfudb.runtime.view.TableRegistry;
 import org.corfudb.runtime.view.stream.StreamAddressSpace;
 import org.corfudb.test.SampleSchema;
+import org.corfudb.util.retry.IRetry;
+import org.corfudb.util.retry.IntervalRetry;
+import org.corfudb.util.retry.RetryNeededException;
+import org.junit.Assert;
 import org.junit.Ignore;
 import org.junit.Test;
+import org.rocksdb.BlockBasedTableConfig;
+import org.rocksdb.Cache;
+import org.rocksdb.Options;
 
+import java.lang.reflect.Field;
+import java.nio.file.Files;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Random;
+import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
-
-import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
 
 import static com.google.protobuf.DescriptorProtos.DescriptorProto;
 import static com.google.protobuf.DescriptorProtos.FileDescriptorProto;
 import static com.google.protobuf.DescriptorProtos.FileDescriptorSet;
 import static com.google.protobuf.Descriptors.DescriptorValidationException;
 import static com.google.protobuf.Descriptors.FileDescriptor;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.corfudb.runtime.object.PersistenceOptions.DISABLE_BLOCK_CACHE;
+import static org.corfudb.runtime.object.PersistenceOptions.disposeBlockCache;
+import static org.corfudb.runtime.object.PersistenceOptions.newBlockCache;
 import static org.corfudb.test.SampleAppliance.Appliance;
 import static org.corfudb.test.SampleSchema.FirewallRule;
 import static org.corfudb.test.SampleSchema.ManagedResources;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * To ensure that feature changes in CorfuStore do not break verticals,
@@ -66,6 +90,7 @@ public class CorfuStoreShimTest extends AbstractViewTest {
     private CorfuRuntime getTestRuntime() {
         return getDefaultRuntime();
     }
+
     /**
      * CorfuStoreShim supports read your transactional writes implicitly when reads
      * happen in a write transaction or vice versa
@@ -147,18 +172,33 @@ public class CorfuStoreShimTest extends AbstractViewTest {
         }
         try (ManagedTxnContext readWriteTxn = shimStore.tx(someNamespace)) {
             UuidMsg key2 = null;
-            assertThatThrownBy( () -> readWriteTxn.putRecord(tableName, key2, null, null))
+            assertThatThrownBy(() -> readWriteTxn.putRecord(tableName, key2, null, null))
                     .isExactlyInstanceOf(IllegalArgumentException.class);
+        }
+
+        // Validate conflict aborts have full tablename in message
+        try (ManagedTxnContext readWriteTxn = shimStore.tx(someNamespace)) {
+            readWriteTxn.putRecord(table, key1, user_1, user_1);
+            CompletableFuture.runAsync(() -> {
+                ManagedTxnContext anotherTxn = shimStore.tx(someNamespace);
+                anotherTxn.putRecord(table, key1, user_1, user_1);
+                anotherTxn.commit();
+            }).get();
+            readWriteTxn.commit();
+        } catch (TransactionAbortedException ex) {
+            assertThat(ex.getMessage()).contains(table.getFullyQualifiedTableName());
         }
     }
 
     /**
-     * Test that closeTable works and removes table from cache
+     * Test that freeTableData works and removes table from cache
+     * Also validates that the subscribeListener() does not throw any exceptions
+     * if called after freeTableData() is invoked.
      *
      * @throws Exception exception
      */
     @Test
-    public void checkCloseTable() throws Exception {
+    public void checkFreeTableData() throws Exception {
 
         // Get a Corfu Runtime instance.
         CorfuRuntime corfuRuntime = getTestRuntime();
@@ -173,64 +213,67 @@ public class CorfuStoreShimTest extends AbstractViewTest {
 
         // Create & Register the table.
         // This is required to initialize the table for the current corfu client.
-        Table<UuidMsg, ManagedMetadata, ManagedMetadata> table = shimStore.openTable(
+        Table<UuidMsg, ExampleSchemas.ClusterUuidMsg, ManagedMetadata> table = shimStore.openTable(
                 someNamespace,
                 tableName,
                 UuidMsg.class,
-                ManagedMetadata.class,
+                ExampleSchemas.ClusterUuidMsg.class,
                 ManagedMetadata.class,
                 // TableOptions includes option to choose - Memory/Disk based corfu table.
                 TableOptions.builder().build());
 
         for (int i = 0; i < PARAMETERS.NUM_ITERATIONS_LARGE; i++) {
-            UUID uuid1 = UUID.nameUUIDFromBytes("1".getBytes());
-            UuidMsg key = UuidMsg.newBuilder().setMsb(i)
-                    .build();
-            ManagedMetadata user_1 = ManagedMetadata.newBuilder().setCreateUser("user_1").build();
-
-            ManagedTxnContext txn = shimStore.tx(someNamespace);
-            txn.putRecord(tableName, key,
-                    ManagedMetadata.newBuilder().setCreateUser("abc").build(),
-                    user_1);
-            txn.commit();
-        }
-
-        assertThatThrownBy(() -> shimStore.closeTable("non", "existent"))
-                .isExactlyInstanceOf(NoSuchElementException.class);
-
-        shimStore.closeTable(someNamespace, tableName);
-
-        // Validate externally that the entry vanishes from corfu's object cache
-        ObjectsView.ObjectID oid = new ObjectsView.ObjectID(table.getStreamUUID(), CorfuTable.class);
-        assertThat(corfuRuntime.getObjectsView().getObjectCache().containsKey(oid)).isFalse();
-
-        // Now re-open a table after it is closed to check that it works..
-        table = shimStore.openTable(
-                someNamespace,
-                tableName,
-                UuidMsg.class,
-                ManagedMetadata.class,
-                ManagedMetadata.class,
-                // TableOptions includes option to choose - Memory/Disk based corfu table.
-                TableOptions.builder().build());
-
-        for (int i = 0; i < PARAMETERS.NUM_ITERATIONS_LARGE; i++) {
-            UUID uuid1 = UUID.nameUUIDFromBytes("1".getBytes());
             UuidMsg key = UuidMsg.newBuilder().setMsb(i)
                     .build();
             ManagedMetadata user_1 = ManagedMetadata.newBuilder().setCreateUser("user_1").build();
 
             ManagedTxnContext txn = shimStore.tx(someNamespace);
             txn.putRecord(table, key,
-                    ManagedMetadata.newBuilder().setCreateUser("abc").build(),
+                    ExampleSchemas.ClusterUuidMsg.newBuilder().setMsb(i).build(),
                     user_1);
+            txn.commit();
+        }
+
+        assertThatThrownBy(() -> shimStore.freeTableData("non", "existent"))
+                .isExactlyInstanceOf(NoSuchElementException.class);
+
+        // Release all the cached objects from the insertions above
+        shimStore.freeTableData(someNamespace, tableName);
+
+        Set<VersionedObjectIdentifier> allKeys = corfuRuntime.getObjectsView().getMvoCache().keySet();
+        assertThat(allKeys.stream().map(VersionedObjectIdentifier::getObjectId).collect(Collectors.toSet()))
+                .isNotEmpty()
+                .doesNotContain(table.getStreamUUID());
+
+        class EmptyStreamListener implements StreamListener {
+            @Override
+            public void onNext(CorfuStreamEntries results) {
+            }
+            @Override
+            public void onError(Throwable throwable) {
+            }
+        }
+        EmptyStreamListener emptyStreamListener = new EmptyStreamListener();
+
+        // verify that subscription does not throw any exceptions because the table was closed
+        shimStore.subscribeListener(emptyStreamListener, someNamespace, "cluster_manager_test");
+
+        // Now simple access the table after free to validate that it works
+        for (int i = 0; i < PARAMETERS.NUM_ITERATIONS_LARGE; i++) {
+            UuidMsg key = UuidMsg.newBuilder().setMsb(i)
+                    .build();
+            ManagedTxnContext txn = shimStore.tx(someNamespace);
+            CorfuStoreEntry<UuidMsg, ExampleSchemas.ClusterUuidMsg, ManagedMetadata> record = txn.getRecord(table, key);
+            assertThat(record.getPayload()).isNotNull();
+            assertThat(record.getPayload().getMsb()).isEqualTo(i);
             txn.commit();
         }
 
         // By some future bug should the table disappear from the object cache ensure that
         // the method still fails gracefully with a NoSuchElementException
+        ObjectID oid = new ObjectID(table.getStreamUUID(), PersistentCorfuTable.class);
         corfuRuntime.getObjectsView().getObjectCache().remove(oid);
-        assertThatThrownBy(() -> shimStore.closeTable(someNamespace, tableName))
+        assertThatThrownBy(() -> shimStore.freeTableData(someNamespace, tableName))
                 .isExactlyInstanceOf(NoSuchElementException.class);
     }
 
@@ -369,6 +412,116 @@ public class CorfuStoreShimTest extends AbstractViewTest {
 
         });
         executeScheduled(numThreads, PARAMETERS.TIMEOUT_LONG);
+    }
+
+    /**
+     * CorfuStore uses WriteAfterWrite Transactions which detect conflicts only on concurrent writes.  For example,
+     * TX1: reads key K (may also perform other operations on other keys and/or tables)
+     * TX2: updates key K concurrently.
+     * When TX1 commits, it will not hit a TransacationAbortedException.  To consider K for conflict resolution, TX1
+     * must touch() it if no other updates are made to it.
+     *
+     * This test runs the above 2 transactions concurrently for 100 iterations and verifies that
+     * TransactionAbortedException gets thrown at least once if the key is touched.
+     * Additionally, it verifies that the exception is not thrown if the key is not touched.
+     * @throws Exception
+     */
+    @Test
+    public void testTouchReqdForReadTxWriteTxConflict() throws Exception {
+        final int numIterations = 100;
+        Assert.assertFalse(runReadAndWriteTxConcurrently(true, numIterations));
+        Assert.assertTrue(runReadAndWriteTxConcurrently(false, numIterations));
+    }
+
+    private boolean runReadAndWriteTxConcurrently(boolean touch, int numIterations) throws Exception {
+        final String namespace = "test_namespace";
+        final String tableName1 = "EventInfo1";
+        final String tableName2 = "EventInfo2";
+        final int numThreads = 2;
+        final int numRecords = 3;
+
+        // Java allows only final variables in a lambda expression.  Use AtomicBoolean so that it can be modified from
+        // the lambda expression.
+        AtomicBoolean success = new AtomicBoolean(true);
+
+        CorfuRuntime corfuRuntime = getDefaultRuntime();
+        CorfuStore corfuStore = new CorfuStore(corfuRuntime);
+
+        // Open 2 tables with the same schema
+        Table<SampleSchema.Uuid, SampleSchema.EventInfo, Message> table1 = corfuStore.openTable(namespace, tableName1,
+            SampleSchema.Uuid.class, SampleSchema.EventInfo.class, null, TableOptions.builder().build());
+
+        Table<SampleSchema.Uuid, SampleSchema.EventInfo, Message> table2 = corfuStore.openTable(namespace, tableName2,
+            SampleSchema.Uuid.class, SampleSchema.EventInfo.class, null, TableOptions.builder().build());
+
+        // Construct the conflict key
+        SampleSchema.Uuid conflictKey = SampleSchema.Uuid.newBuilder().setLsb(0).setMsb(0).build();
+
+        // In each iteration, write 3 records in table1.  Then start 2 transactions concurrently.  TX1 reads the
+        // conflict key from table1, touches it(touch == true) and writes it to table2.  TX2 updates the conflict key
+        // in table1.
+        // The expected behavior is that TX1 should hit a TransactionAbortedException in at least 1 iteration if the
+        // conflict key is touched.
+        for (int i = 0; i < numIterations; i++) {
+            // Write sample records in table1
+            for (int j = 0; j < numRecords; j++) {
+                SampleSchema.Uuid key = SampleSchema.Uuid.newBuilder().setLsb(j).setMsb(j).build();
+                SampleSchema.EventInfo value = SampleSchema.EventInfo.newBuilder().setName("test" + j).build();
+                try (TxnContext txnContext = corfuStore.txn(namespace)) {
+                    txnContext.putRecord(table1, key, value, null);
+                    txnContext.commit();
+                }
+            }
+
+            // TX1
+            scheduleConcurrently(f -> {
+                try (TxnContext txnContext = corfuStore.txn(namespace)) {
+                    SampleSchema.EventInfo value =
+                        (SampleSchema.EventInfo) txnContext.getRecord(tableName1, conflictKey).getPayload();
+                    if (touch) {
+                        txnContext.touch(tableName1, conflictKey);
+                    }
+                    txnContext.putRecord(table2, conflictKey, value, null);
+                    txnContext.commit();
+                } catch (TransactionAbortedException tae) {
+                    success.set(false);
+                }
+            });
+
+            // TX2 updates the conflict key
+            int index = i;
+            SampleSchema.EventInfo newVal = SampleSchema.EventInfo.newBuilder().setName("test_new" + index).build();
+            scheduleConcurrently(f -> {
+                try {
+                    IRetry.build(IntervalRetry.class, () -> {
+                        try (TxnContext txnContext = corfuStore.txn(namespace)) {
+                            txnContext.putRecord(table1, conflictKey, newVal, null);
+                            txnContext.commit();
+                        } catch (TransactionAbortedException tae) {
+                            throw new RetryNeededException();
+                        }
+                        return null;
+                    }).run();
+                } catch (Exception e) {
+                    log.error("Could not update the conflict key", e);
+                }
+            });
+
+            executeScheduled(numThreads, PARAMETERS.TIMEOUT_NORMAL);
+
+            // Verify that the write in TX2 was successful
+            try (TxnContext txnContext = corfuStore.txn(namespace)) {
+                Assert.assertEquals(newVal, txnContext.getRecord(tableName1, conflictKey).getPayload());
+                assertThat(txnContext.getTxnSequence()).isNotEqualTo(Token.UNINITIALIZED.getSequence());
+                assertThat(txnContext.getEpoch()).isNotEqualTo(Token.UNINITIALIZED.getEpoch());
+                txnContext.commit();
+            }
+
+            // Clear the tables after each iteration
+            table1.clearAll();
+            table2.clearAll();
+        }
+        return success.get();
     }
 
     /**
@@ -558,7 +711,7 @@ public class CorfuStoreShimTest extends AbstractViewTest {
                 key1,
                 ManagedMetadata.newBuilder().setCreateUser("abc").build(),
                 null);
-               txn.commit();
+        txn.commit();
         txn = shimStore.tx(someNamespace);
         txn.putRecord(table,
                 key1,
@@ -638,7 +791,7 @@ public class CorfuStoreShimTest extends AbstractViewTest {
         try (ManagedTxnContext txn = shimStore.tx(someNamespace)) {
             txn.putRecord(tableName, key, value,
                     LogReplicationEntryMetadataMsg.newBuilder()
-                            .setTimestamp(one+twelve)
+                            .setTimestamp(one + twelve)
                             .build());
             txn.commit();
         }
@@ -649,7 +802,7 @@ public class CorfuStoreShimTest extends AbstractViewTest {
 
         assertThat(entry.getMetadata().getTopologyConfigID()).isEqualTo(twelve);
         assertThat(entry.getMetadata().getSyncRequestId().getMsb()).isEqualTo(one);
-        assertThat(entry.getMetadata().getTimestamp()).isEqualTo(twelve+one);
+        assertThat(entry.getMetadata().getTimestamp()).isEqualTo(twelve + one);
 
         // Rolling Upgrade compatibility test: It should be ok to set a different metadata schema message
         try (ManagedTxnContext txn = shimStore.tx(someNamespace)) {
@@ -827,18 +980,18 @@ public class CorfuStoreShimTest extends AbstractViewTest {
         assertThat(TransactionalContext.isInTransaction()).isFalse();
 
         // ----- check nested transactions NOT started by CorfuStore isn't messed up by CorfuStore txn -----
-        CorfuTable<String, String>
+        PersistentCorfuTable<String, String>
                 corfuTable = corfuRuntime.getObjectsView().build()
-                .setTypeToken(new TypeToken<CorfuTable<String, String>>() {})
+                .setTypeToken(new TypeToken<PersistentCorfuTable<String, String>>() {})
                 .setStreamName("test")
                 .open();
 
         corfuRuntime.getObjectsView()
                 .TXBuild()
                 .type(TransactionType.WRITE_AFTER_WRITE).build().begin();
-        corfuTable.put("k1", "a"); // Load non-CorfuStore data
-        corfuTable.put("k2", "ab");
-        corfuTable.put("k3", "b");
+        corfuTable.insert("k1", "a"); // Load non-CorfuStore data
+        corfuTable.insert("k2", "ab");
+        corfuTable.insert("k3", "b");
         CorfuStoreEntry<UuidMsg, ManagedMetadata, ManagedMetadata> entry;
         try (ManagedTxnContext nestedTxn = shimStore.txn(someNamespace)) {
             nestedTxn.putRecord(tableName, key, ManagedMetadata.newBuilder().setLastModifiedUser("secondUser").build());
@@ -855,6 +1008,7 @@ public class CorfuStoreShimTest extends AbstractViewTest {
     /**
      * This test validates that the CorfuQueue api via the CorfuStore layer binds the fate and order of the
      * queue operations with that of its parent transaction.
+     *
      * @throws Exception could be a corfu runtime exception if bad things happen.
      */
     @Test
@@ -890,7 +1044,7 @@ public class CorfuStoreShimTest extends AbstractViewTest {
         ArrayList<Long> validator = new ArrayList<>(numIterations);
         for (long i = 0L; i < numIterations; i++) {
             ExampleSchemas.ExampleValue queueData = ExampleSchemas.ExampleValue.newBuilder()
-                    .setPayload(""+i)
+                    .setPayload("" + i)
                     .setAnotherKey(i).build();
             final int two = 2;
             try (ManagedTxnContext txn = shimStore.txn(someNamespace)) {
@@ -918,7 +1072,7 @@ public class CorfuStoreShimTest extends AbstractViewTest {
         // Also validate that the order of the queue matches that of the commit order.
         for (int i = 0; i < validator.size(); i++) {
             log.debug("Entry:" + records.get(i).getRecordId());
-            Long order = ((ExampleSchemas.ExampleValue)records.get(i).getEntry()).getAnotherKey();
+            Long order = ((ExampleSchemas.ExampleValue) records.get(i).getEntry()).getAnotherKey();
             assertThat(order).isEqualTo(validator.get(i));
         }
     }
@@ -1003,7 +1157,7 @@ public class CorfuStoreShimTest extends AbstractViewTest {
         final String tableName = "ManagedMetadata";
 
         // Create & Register the table
-        assertThatThrownBy( () -> shimStore.openTable(
+        assertThatThrownBy(() -> shimStore.openTable(
                 someNamespace,
                 tableName,
                 UuidMsg.class,
@@ -1011,7 +1165,7 @@ public class CorfuStoreShimTest extends AbstractViewTest {
                 null,
                 TableOptions.builder().build())).isExactlyInstanceOf(IllegalArgumentException.class);
 
-        assertThatThrownBy( () -> shimStore.openTable(
+        assertThatThrownBy(() -> shimStore.openTable(
                 someNamespace,
                 tableName,
                 null,
@@ -1088,8 +1242,9 @@ public class CorfuStoreShimTest extends AbstractViewTest {
      * ProtobufDescriptorTable should de-duplicate common protobuf file descriptors.
      * This test creates a large number of tables that share protobuf files and validates
      * that de-duplication occurs.
-     *
+     * <p>
      * It also verifies that the second registration is omitted.
+     *
      * @throws Exception exception
      */
     @Test
@@ -1119,7 +1274,7 @@ public class CorfuStoreShimTest extends AbstractViewTest {
         for (int i = 0; i < numTables; i++) {
             shimStore.openTable(
                     someNamespace,
-                    tableNamePrefix+i,
+                    tableNamePrefix + i,
                     UuidMsg.class,
                     ManagedMetadata.class,
                     ManagedMetadata.class,
@@ -1127,7 +1282,7 @@ public class CorfuStoreShimTest extends AbstractViewTest {
                     TableOptions.builder().build());
         }
 
-        final CorfuTable<ProtobufFileName,
+        final PersistentCorfuTable<ProtobufFileName,
                 CorfuRecord<ProtobufFileDescriptor,
                         CorfuStoreMetadata.TableMetadata>> descriptorTable =
                 shimStore.getRuntime().getTableRegistry().getProtobufDescriptorTable();
@@ -1143,14 +1298,15 @@ public class CorfuStoreShimTest extends AbstractViewTest {
         CorfuStoreMetadata.TableName tableName = CorfuStoreMetadata.TableName
                 .newBuilder()
                 .setNamespace(someNamespace)
-                .setTableName(tableNamePrefix+"0")
+                .setTableName(tableNamePrefix + "0")
                 .build();
-        final Collection<CorfuRecord<ProtobufFileDescriptor, CorfuStoreMetadata.TableMetadata>> records =
-                corfuRuntime.getTableRegistry().getProtobufDescriptorTable().values();
+
+        Collection<CorfuRecord<ProtobufFileDescriptor, CorfuStoreMetadata.TableMetadata>> records =
+                corfuRuntime.getTableRegistry().getProtobufDescriptorTable().entryStream().map(Map.Entry::getValue).collect(Collectors.toList());
 
         shimStore.openTable(
                 someNamespace,
-                tableNamePrefix+"0",
+                tableNamePrefix + "0",
                 UuidMsg.class,
                 org.corfudb.runtime.proto.LogData.LogDataMsg.class, // this brings in 1 new protobuf file
                 ManagedMetadata.class,
@@ -1163,9 +1319,470 @@ public class CorfuStoreShimTest extends AbstractViewTest {
         // verify the second registration is omitted.
         final int numProtoFilesAfterChange =
                 corfuRuntime.getTableRegistry().getProtobufDescriptorTable().size();
-        final Collection<CorfuRecord<ProtobufFileDescriptor, CorfuStoreMetadata.TableMetadata>>
-                recordsAfterChange = corfuRuntime.getTableRegistry().getProtobufDescriptorTable().values();
-        assertThat(numProtoFiles).isEqualTo(numProtoFilesAfterChange);
+
+        final Collection<CorfuRecord<ProtobufFileDescriptor, CorfuStoreMetadata.TableMetadata>> recordsAfterChange =
+                corfuRuntime.getTableRegistry().getProtobufDescriptorTable().entryStream().map(Map.Entry::getValue).collect(Collectors.toList());
+
+        // Refresh descriptor table
+        records = corfuRuntime.getTableRegistry()
+                .getProtobufDescriptorTable()
+                .entryStream()
+                .map(Map.Entry::getValue)
+                .collect(Collectors.toList());
+
+        // We added new protofile logdata
+        assertThat(numProtoFiles).isEqualTo(numProtoFilesAfterChange - 1);
         assertThat(records).containsExactlyElementsOf(recordsAfterChange);
+    }
+
+    @Test
+    public void validateCommitAlwaysReturnsRealAddress() throws Exception {
+
+        // Get a Corfu Runtime instance.
+        CorfuRuntime corfuRuntime = getTestRuntime();
+        // Creating Corfu Store using a connected corfu client.
+        CorfuStoreShim shimStore = new CorfuStoreShim(corfuRuntime);
+
+        final String someNamespace = "some-namespace";
+        final String tableName = "ManagedMetadata";
+        Table<UuidMsg, ManagedMetadata, ManagedMetadata> table = shimStore.openTable(
+                someNamespace,
+                tableName,
+                UuidMsg.class,
+                ManagedMetadata.class,
+                ManagedMetadata.class,
+                // TableOptions includes option to choose - Memory/Disk based corfu table.
+                TableOptions.builder().build());
+        try (ManagedTxnContext txnContext = shimStore.tx(someNamespace)) {
+            txnContext.count(table);
+            CorfuStoreMetadata.Timestamp ts = txnContext.commit();
+            assertThat(ts.getSequence()).isPositive();
+        }
+        try (ManagedTxnContext txnContext = shimStore.tx(someNamespace)) {
+            CorfuStoreMetadata.Timestamp ts = txnContext.commit();
+            assertThat(ts.getSequence()).isPositive();
+        }
+    }
+
+    /**
+     * This test verifies that registry table will be updated when a table is opened
+     * again with different schema options.
+     */
+    @Test
+    public void testRegistryTableUpdateOnRecordChange() throws Exception {
+        // Get a Corfu Runtime instance.
+        CorfuRuntime corfuRuntime = getDefaultRuntime();
+
+        // Creating Corfu Store using a connected corfu client.
+        CorfuStoreShim shimStore = new CorfuStoreShim(corfuRuntime);
+
+        // Define a namespace for the table.
+        final String someNamespace = "some-namespace";
+        // Define table name.
+        final String tableName = "EventInfo";
+
+        // Create & Register the table.
+        // This is required to initialize the table for the current corfu client.
+        shimStore.openTable(
+                someNamespace,
+                tableName,
+                SampleSchema.Uuid.class,
+                SampleSchema.SampleTableAMsg.class,
+                null,
+                // TableOptions includes option to choose - Memory/Disk based corfu table.
+                TableOptions.builder().build());
+
+        CorfuStoreMetadata.TableName tableNameKey =
+                CorfuStoreMetadata.TableName.newBuilder()
+                        .setNamespace(someNamespace)
+                        .setTableName(tableName)
+                        .build();
+        CorfuRecord<CorfuStoreMetadata.TableDescriptors, CorfuStoreMetadata.TableMetadata> record
+                = corfuRuntime.getTableRegistry().getRegistryTable().get(tableNameKey);
+        CorfuOptions.SchemaOptions options = record.getMetadata().getTableOptions();
+
+        assertThat(options.getIsFederated()).isTrue();
+        assertThat(options.getRequiresBackupSupport()).isTrue();
+        assertThat(options.getStreamTag(0)).isEqualTo("sample_streamer_1");
+        assertThat(options.getStreamTag(1)).isEqualTo("sample_streamer_2");
+
+        // Open the same table again with different schema options, verify that registry table
+        // gets updated
+        shimStore.openTable(
+                someNamespace,
+                tableName,
+                SampleSchema.Uuid.class,
+                SampleSchema.SampleTableBMsg.class,
+                null,
+                // TableOptions includes option to choose - Memory/Disk based corfu table.
+                TableOptions.builder().build());
+
+        record = corfuRuntime.getTableRegistry().getRegistryTable().get(tableNameKey);
+        options = record.getMetadata().getTableOptions();
+
+        assertThat(options.getIsFederated()).isTrue();
+        assertThat(options.getRequiresBackupSupport()).isFalse();
+        assertThat(options.getStreamTag(0)).isEqualTo("sample_streamer_2");
+        assertThat(options.getStreamTag(1)).isEqualTo("sample_streamer_3");
+
+        // Open the same table again with different schema options, verify that registry table
+        // gets updated
+        shimStore.openTable(
+                someNamespace,
+                tableName,
+                SampleSchema.Uuid.class,
+                SampleSchema.SampleTableBMsg.class,
+                null,
+                // TableOptions includes option to choose - Memory/Disk based corfu table.
+                TableOptions.builder().build());
+
+        record = corfuRuntime.getTableRegistry().getRegistryTable().get(tableNameKey);
+        options = record.getMetadata().getTableOptions();
+
+        assertThat(options.getIsFederated()).isTrue();
+        assertThat(options.getRequiresBackupSupport()).isFalse();
+        assertThat(options.getStreamTagCount()).isEqualTo(2);
+        assertThat(options.getStreamTag(0)).isEqualTo("sample_streamer_2");
+        assertThat(options.getStreamTag(1)).isEqualTo("sample_streamer_3");
+        assertThat(options.getReplicationGroup().getLogicalGroup()).isEqualTo("group1");
+        assertThat(options.getReplicationGroup().getClientName()).isEqualTo("logical_group_consumer");
+
+        // Open the same table again with different schema options, verify that registry table
+        // gets updated
+        shimStore.openTable(
+                someNamespace,
+                tableName,
+                SampleSchema.Uuid.class,
+                SampleSchema.SampleTableEMsg.class,
+                null,
+                // TableOptions includes option to choose - Memory/Disk based corfu table.
+                TableOptions.builder().build());
+
+        record = corfuRuntime.getTableRegistry().getRegistryTable().get(tableNameKey);
+        options = record.getMetadata().getTableOptions();
+
+        assertThat(options.getIsFederated()).isTrue();
+        assertThat(options.getRequiresBackupSupport()).isFalse();
+        assertThat(options.getStreamTagCount()).isEqualTo(1);
+        assertThat(options.getStreamTag(0)).isEqualTo("sample_streamer_4");
+        assertThat(options.getSecondaryKeyCount()).isEqualTo(1);
+        assertThat(options.getSecondaryKey(0).getIndexPath()).isEqualTo("event_time");
+    }
+
+    /**
+     * Ensure that {@link ObjectID}'s type is used during object cache operations.
+     */
+    @Test
+    public void testTableType() throws Exception {
+        // Get a Corfu Runtime instance.
+        CorfuRuntime corfuRuntime = getDefaultRuntime();
+
+        // Creating Corfu Store using a connected corfu client.
+        CorfuStoreShim shimStore = new CorfuStoreShim(corfuRuntime);
+
+        // Define a namespace for the table.
+        final String someNamespace = "some-namespace";
+        // Define table name.
+        final String tableName = "DiskTable";
+        final String dataPath = Files.createTempDirectory(tableName).toString();
+
+        PersistenceOptions persistenceOptions = PersistenceOptions.newBuilder()
+                .setDataPath(dataPath)
+                .build();
+
+        final Table<?, ?, ?> inMemoryTable = shimStore.openTable(
+                someNamespace,
+                tableName,
+                SampleSchema.Uuid.class,
+                SampleSchema.SampleTableAMsg.class,
+                ManagedResources.class,
+                TableOptions.builder().build());
+        assertThat(inMemoryTable.getUnderlyingType()).isEqualTo(PersistentCorfuTable.class);
+
+        final Table<?, ?, ?> diskBackedTable = shimStore.openTable(
+                someNamespace,
+                tableName,
+                SampleSchema.Uuid.class,
+                SampleSchema.SampleTableAMsg.class,
+                ManagedResources.class,
+                TableOptions.builder().persistenceOptions(persistenceOptions).build());
+        assertThat(diskBackedTable.getUnderlyingType()).isEqualTo(PersistedCorfuTable.class);
+
+        inMemoryTable.close();
+        diskBackedTable.close();
+    }
+
+    @Test
+    public void testCloseOpen() throws Exception {
+        final int numEntries = 1000;
+        // Get a Corfu Runtime instance.
+        CorfuRuntime corfuRuntime = getDefaultRuntime();
+
+        // Creating Corfu Store using a connected corfu client.
+        CorfuStoreShim shimStore = new CorfuStoreShim(corfuRuntime);
+
+        // Define a namespace for the table.
+        final String someNamespace = "some-namespace";
+        // Define table name.
+        final String tableName = "DiskTable";
+        final String dataPath = Files.createTempDirectory(tableName).toString();
+        final String LOCK_FILE = "LOCK";
+
+        PersistenceOptions persistenceOptions = PersistenceOptions.newBuilder()
+                .setDataPath(dataPath)
+                .build();
+
+        Table<SampleSchema.Uuid, SampleSchema.SampleTableAMsg, ManagedResources> table = shimStore.openTable(
+                someNamespace,
+                tableName,
+                SampleSchema.Uuid.class,
+                SampleSchema.SampleTableAMsg.class,
+                ManagedResources.class,
+                TableOptions.builder().persistenceOptions(persistenceOptions).build());
+
+
+        try (ManagedTxnContext txnContext = shimStore.tx(someNamespace)) {
+            for (int i = 0; i < numEntries; i++) {
+                SampleSchema.Uuid key = SampleSchema.Uuid.newBuilder().setLsb(i).setMsb(i).build();
+                SampleSchema.SampleTableAMsg value = SampleSchema.SampleTableAMsg.newBuilder()
+                        .setPayload(String.valueOf(i)).build();
+                txnContext.putRecord(table, key, value, null);
+            }
+
+            CorfuStoreMetadata.Timestamp ts = txnContext.commit();
+            assertThat(ts.getSequence()).isPositive();
+        }
+
+        assertTrue(Files.exists(Paths.get(dataPath, LOCK_FILE)));
+        table.close();
+        assertFalse(Files.exists(Paths.get(dataPath, LOCK_FILE)));
+
+        table = shimStore.openTable(
+                someNamespace,
+                tableName,
+                SampleSchema.Uuid.class,
+                SampleSchema.SampleTableAMsg.class,
+                ManagedResources.class,
+                TableOptions.builder().persistenceOptions(persistenceOptions).build());
+
+        assertThat(table.count()).isEqualTo(numEntries);
+    }
+
+    private Cache getBlockCache(Options options) throws NoSuchFieldException, IllegalAccessException {
+        final BlockBasedTableConfig tableConfig = (BlockBasedTableConfig) options.tableFormatConfig();
+        final Field field = BlockBasedTableConfig.class.getDeclaredField("blockCache");
+        field.setAccessible(true);
+        return (Cache) field.get(tableConfig);
+    }
+
+    private Options getRocksDbOptions(Table<?, ?, ?> table) {
+        final ObjectID thisId = ObjectID.builder()
+                .type( PersistedCorfuTable.getTypeToken().getRawType())
+                .streamID(table.getStreamUUID()).build();
+        final PersistedCorfuTable<?, ?> persistedTable = (PersistedCorfuTable<?, ?>) getRuntime().getObjectsView()
+                .getObjectCache().get(thisId);
+        final DiskBackedCorfuTable<?, ?> diskTable = (DiskBackedCorfuTable<?, ?>) persistedTable
+                .getCorfuSMRProxy().getUnderlyingMVO().getCurrentObject();
+        final RocksDbStore<?> rocksStore = (RocksDbStore<?>) diskTable.getRocksApi();
+        return rocksStore.getRocksDbOptions();
+    }
+
+    @Test
+    public void testBlockCache() throws Exception {
+        // Get a Corfu Runtime instance.
+        CorfuRuntime corfuRuntime = getDefaultRuntime();
+
+        // Creating Corfu Store using a connected corfu client.
+        CorfuStoreShim shimStore = new CorfuStoreShim(corfuRuntime);
+
+        // Define a namespace for the table.
+        final String someNamespace = "some-namespace";
+        final String tableName = "DiskTable";
+
+        {
+            final String dataPath = Files.createTempDirectory(tableName).toString();
+            final int INVALID_CACHE_INDEX = 100;
+            PersistenceOptions persistenceOptions = PersistenceOptions.newBuilder()
+                    .setDataPath(dataPath)
+                    .setBlockCacheIndex(INVALID_CACHE_INDEX)
+                    .build();
+
+            assertThatThrownBy(() -> shimStore.openTable(someNamespace, tableName,
+                            SampleSchema.Uuid.class,
+                            SampleSchema.SampleTableAMsg.class,
+                            ManagedResources.class,
+                            TableOptions.builder().persistenceOptions(persistenceOptions).build()))
+                    .isInstanceOf(NoSuchElementException.class);
+
+            // Provide invalid indexes.
+            disposeBlockCache(INVALID_CACHE_INDEX);
+            disposeBlockCache(Integer.MAX_VALUE);
+            disposeBlockCache(Integer.MIN_VALUE);
+        }
+
+        {
+            final int writeBufferSize = 4 * 1024 * 1024; // 2MB
+            final int blockCacheSize = 4 * 1024 * 1024; // 2MB
+            final int blockCacheIndex = newBlockCache(blockCacheSize);
+            final String dataPath = Files.createTempDirectory(tableName).toString();
+            PersistenceOptions persistenceOptions = PersistenceOptions.newBuilder()
+                    .setDataPath(dataPath)
+                    .setWriteBufferSize(writeBufferSize)
+                    .setBlockCacheIndex(blockCacheIndex)
+                    .build();
+
+            try (Table<SampleSchema.SampleTableAMsg, SampleSchema.SampleTableAMsg, ManagedResources> table =
+                         shimStore.openTable(someNamespace, tableName,
+                                 SampleSchema.SampleTableAMsg.class,
+                                 SampleSchema.SampleTableAMsg.class,
+                                 ManagedResources.class,
+                                 TableOptions.builder().persistenceOptions(persistenceOptions).build())) {
+                final Options rocksDbOptions = getRocksDbOptions(table);
+                assertThat(rocksDbOptions.writeBufferSize()).isEqualTo(writeBufferSize);
+                final BlockBasedTableConfig tableConfig = (BlockBasedTableConfig) rocksDbOptions.tableFormatConfig();
+                assertThat(tableConfig.noBlockCache()).isEqualTo(false);
+                final Cache cache = getBlockCache(rocksDbOptions);
+                assertThat(org.corfudb.runtime.object.PersistenceOptions.getBlockCache(blockCacheIndex)).isEqualTo(cache);
+
+                disposeBlockCache(blockCacheIndex);
+                // Ensure that the action is idempotent.
+                disposeBlockCache(blockCacheIndex);
+            }
+        }
+
+        {
+            final int writeBufferSize = 4 * 1024 * 1024; // 4MB
+            final String dataPath = Files.createTempDirectory(tableName).toString();
+            PersistenceOptions persistenceOptions = PersistenceOptions.newBuilder()
+                    .setDataPath(dataPath)
+                    .setWriteBufferSize(writeBufferSize)
+                    .setBlockCacheIndex(DISABLE_BLOCK_CACHE)
+                    .build();
+
+            try (Table<SampleSchema.SampleTableAMsg, SampleSchema.SampleTableAMsg, ManagedResources> table =
+                         shimStore.openTable(someNamespace, tableName,
+                                 SampleSchema.SampleTableAMsg.class,
+                                 SampleSchema.SampleTableAMsg.class,
+                                 ManagedResources.class,
+                                 TableOptions.builder().persistenceOptions(persistenceOptions).build())) {
+
+                final Options rocksDbOptions = getRocksDbOptions(table);
+                assertThat(rocksDbOptions.writeBufferSize()).isEqualTo(writeBufferSize);
+                final BlockBasedTableConfig tableConfig = (BlockBasedTableConfig) rocksDbOptions.tableFormatConfig();
+                assertThat(tableConfig.noBlockCache()).isEqualTo(true);
+            }
+        }
+    }
+
+    @Test
+    public void testDiskBackedTable() throws Exception {
+        final int numEntries = 1000;
+        // Get a Corfu Runtime instance.
+        CorfuRuntime corfuRuntime = getDefaultRuntime();
+
+        // Creating Corfu Store using a connected corfu client.
+        CorfuStoreShim shimStore = new CorfuStoreShim(corfuRuntime);
+
+        // Define a namespace for the table.
+        final String someNamespace = "some-namespace";
+        // Define table name.
+        final String tableName = "DiskTable";
+        final String dataPath = Files.createTempDirectory(tableName).toString();
+        final String LOCK_FILE = "LOCK";
+
+        PersistenceOptions persistenceOptions = PersistenceOptions.newBuilder()
+                .setDataPath(dataPath)
+                .build();
+
+        final Table<SampleSchema.Uuid, SampleSchema.SampleTableAMsg, ManagedResources> table = shimStore.openTable(
+                someNamespace,
+                tableName,
+                SampleSchema.Uuid.class,
+                SampleSchema.SampleTableAMsg.class,
+                ManagedResources.class,
+                TableOptions.builder().persistenceOptions(persistenceOptions).build());
+
+        assertTrue(Files.exists(Paths.get(dataPath, LOCK_FILE)));
+
+        try (ManagedTxnContext txnContext = shimStore.tx(someNamespace)) {
+            for (int i = 0; i < numEntries; i++) {
+                SampleSchema.Uuid key = SampleSchema.Uuid.newBuilder().setLsb(i).setMsb(i).build();
+                SampleSchema.SampleTableAMsg value = SampleSchema.SampleTableAMsg.newBuilder()
+                        .setPayload(String.valueOf(i)).build();
+                txnContext.putRecord(table, key, value, null);
+            }
+
+            CorfuStoreMetadata.Timestamp ts = txnContext.commit();
+            assertThat(ts.getSequence()).isPositive();
+        }
+
+        try (ManagedTxnContext txnContext = shimStore.tx(someNamespace)) {
+            // Ensure that count() works.
+            assertThat(txnContext.count(table)).isEqualTo(numEntries);
+
+            final Set<SampleSchema.Uuid> keySet = new HashSet<>();
+            final Set<SampleSchema.SampleTableAMsg> valueSet = new HashSet<>();
+
+
+            // Ensure that get() works.
+            for (int i = 0; i < numEntries; i++) {
+                SampleSchema.Uuid key = SampleSchema.Uuid.newBuilder().setLsb(i).setMsb(i).build();
+                SampleSchema.SampleTableAMsg expectedKey = SampleSchema.SampleTableAMsg.newBuilder()
+                        .setPayload(String.valueOf(i)).build();
+                CorfuStoreEntry<?, SampleSchema.SampleTableAMsg, ?> entry = txnContext.getRecord(table, key);
+                assertThat(entry.getPayload()).isEqualTo(expectedKey);
+                keySet.add(key);
+                valueSet.add(expectedKey);
+            }
+
+            // Check the streaming API.
+            assertThat(txnContext.entryStream(table)
+                            .map(CorfuStoreEntry::getKey).collect(Collectors.toSet()))
+                    .isEqualTo(keySet);
+
+            assertThat(txnContext.entryStream(table)
+                    .map(CorfuStoreEntry::getPayload).collect(Collectors.toSet()))
+                    .isEqualTo(valueSet);
+
+            CorfuStoreMetadata.Timestamp ts = txnContext.commit();
+            assertThat(ts.getSequence()).isPositive();
+        }
+
+        try (ManagedTxnContext txnContext = shimStore.tx(someNamespace)) {
+            for (int i = 0; i < numEntries/2; i++) {
+                SampleSchema.Uuid key = SampleSchema.Uuid.newBuilder().setLsb(i).setMsb(i).build();
+                SampleSchema.SampleTableAMsg value = SampleSchema.SampleTableAMsg.newBuilder()
+                        .setPayload(String.valueOf(i)).build();
+                txnContext.delete(table, key);
+            }
+
+            CorfuStoreMetadata.Timestamp ts = txnContext.commit();
+            assertThat(ts.getSequence()).isPositive();
+        }
+
+        try (ManagedTxnContext txnContext = shimStore.tx(someNamespace)) {
+            // Make sure the entries were actually removed.
+            assertThat(txnContext.count(table)).isEqualTo(numEntries/2);
+
+            CorfuStoreMetadata.Timestamp ts = txnContext.commit();
+            assertThat(ts.getSequence()).isPositive();
+        }
+
+        // Ensure that the underlying RocksDB instance is released.
+        try (ManagedTxnContext ignored = shimStore.tx(someNamespace)) {
+            shimStore.freeTableData(someNamespace, tableName);
+        }
+
+        final Table<SampleSchema.Uuid, SampleSchema.SampleTableAMsg, ManagedResources> newTable = shimStore.openTable(
+                someNamespace,
+                tableName,
+                SampleSchema.Uuid.class,
+                SampleSchema.SampleTableAMsg.class,
+                ManagedResources.class,
+                TableOptions.builder().persistenceOptions(persistenceOptions).build());
+
+        try (ManagedTxnContext txnContext = shimStore.tx(someNamespace)) {
+            assertThat(txnContext.count(table)).isEqualTo(numEntries/2);
+        }
     }
 }

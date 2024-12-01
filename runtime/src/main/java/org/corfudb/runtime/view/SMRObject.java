@@ -2,13 +2,11 @@ package org.corfudb.runtime.view;
 
 import com.google.common.reflect.TypeToken;
 import lombok.AllArgsConstructor;
-import lombok.Builder;
 import lombok.Getter;
 import lombok.NonNull;
 import lombok.extern.slf4j.Slf4j;
 import org.corfudb.runtime.CorfuRuntime;
 import org.corfudb.runtime.exceptions.unrecoverable.UnrecoverableCorfuError;
-import org.corfudb.runtime.object.CorfuCompileProxy;
 import org.corfudb.runtime.object.CorfuCompileWrapperBuilder;
 import org.corfudb.runtime.object.ICorfuSMR;
 import org.corfudb.util.serializer.ISerializer;
@@ -29,9 +27,8 @@ import java.util.UUID;
  */
 @Slf4j
 @Getter
-@Builder(builderClassName = "Builder")
 @AllArgsConstructor
-public class SMRObject<T extends ICorfuSMR<T>> {
+public class SMRObject<T extends ICorfuSMR<?>> {
 
     @NonNull
     private final CorfuRuntime runtime;
@@ -49,7 +46,7 @@ public class SMRObject<T extends ICorfuSMR<T>> {
     private final ISerializer serializer;
 
     @NonNull
-    private final ObjectOpenOption option;
+    private ObjectOpenOption openOption;
 
     @NonNull
     private final Object[] arguments;
@@ -57,34 +54,39 @@ public class SMRObject<T extends ICorfuSMR<T>> {
     @NonNull
     private final Set<UUID> streamTags;
 
-    public static class Builder<T extends ICorfuSMR<T>> {
+    public static class Builder<T extends ICorfuSMR<?>> {
 
+        private String streamName;
         private ISerializer serializer = Serializers.getDefaultSerializer();
-        private ObjectOpenOption option = ObjectOpenOption.CACHE;
         private Object[] arguments = new Object[0];
+        private ObjectOpenOption openOption = ObjectOpenOption.CACHE;
+        private CorfuRuntime corfuRuntime;
+
         @Getter
         private Class<T> type;
-        @Getter
-        private CorfuRuntime runtime;
         @Getter
         public UUID streamID;
         @Getter
         private Set<UUID> streamTags = new HashSet<>();
 
         private void verify() {
-            if (streamName != null && !UUID.nameUUIDFromBytes(streamName.getBytes()).equals(streamID)) {
+            if (this.streamName != null && !UUID.nameUUIDFromBytes(streamName.getBytes()).equals(streamID)) {
                 throw new IllegalArgumentException("Stream id must be derived from stream name");
             }
         }
+        public <R extends ICorfuSMR<?>> SMRObject.Builder<R> setCorfuRuntime(CorfuRuntime corfuRuntime) {
+            this.corfuRuntime = corfuRuntime;
+            return (SMRObject.Builder<R>) this;
+        }
 
         @SuppressWarnings("unchecked")
-        public <R extends ICorfuSMR<R>> SMRObject.Builder<R>  setType(Class<R> type) {
+        public <R extends ICorfuSMR<?>> SMRObject.Builder<R> setType(Class<R> type) {
             this.type = (Class<T>) type;
             return (SMRObject.Builder<R>) this;
         }
 
         @SuppressWarnings("unchecked")
-        public <R extends ICorfuSMR<R>> SMRObject.Builder<R> setTypeToken(TypeToken<R> typeToken) {
+        public <R extends ICorfuSMR<?>> SMRObject.Builder<R> setTypeToken(TypeToken<R> typeToken) {
             this.type = (Class<T>) typeToken.getRawType();
             return (SMRObject.Builder<R>) this;
         }
@@ -110,7 +112,7 @@ public class SMRObject<T extends ICorfuSMR<T>> {
         }
 
         public SMRObject.Builder<T> addOpenOption(ObjectOpenOption openOption) {
-            this.option = openOption;
+            this.openOption = openOption;
             return this;
         }
 
@@ -129,31 +131,28 @@ public class SMRObject<T extends ICorfuSMR<T>> {
                 streamID = UUID.nameUUIDFromBytes(streamName.getBytes());
             }
             verify();
-            return new SMRObject<>(runtime, type, streamID, streamName,
-                serializer, option, arguments, streamTags);
+            return new SMRObject<>(corfuRuntime, type, streamID, streamName,
+                serializer, openOption, arguments, streamTags);
         }
 
         public T open() {
             final SMRObject<T> smrObject = build();
 
             try {
-                log.info("ObjectBuilder: open Corfu stream {} id {}", smrObject.getStreamName(),
+                log.info(CorfuRuntime.LOG_NOT_IMPORTANT, "ObjectBuilder: open Corfu stream {} id {}", smrObject.getStreamName(),
                         smrObject.getStreamID());
 
-                if (smrObject.getOption() == ObjectOpenOption.NO_CACHE) {
+                if (smrObject.getOpenOption() == ObjectOpenOption.NO_CACHE) {
                     return CorfuCompileWrapperBuilder.getWrapper(smrObject);
                 } else {
-                    ObjectsView.ObjectID<T> oid = new ObjectsView.ObjectID(streamID, type);
+                    ObjectsView.ObjectID oid = new ObjectsView.ObjectID(streamID, type);
                     return (T) smrObject.getRuntime().getObjectsView().objectCache.computeIfAbsent(oid, x -> {
                                 try {
                                     T result = CorfuCompileWrapperBuilder.getWrapper(smrObject);
 
                                     // Get object serializer to check if we didn't attempt to set another serializer
                                     // to an already existing map
-                                    ISerializer objectSerializer = ((CorfuCompileProxy) ((ICorfuSMR) result).
-                                            getCorfuSMRProxy())
-                                            .getSerializer();
-
+                                    ISerializer objectSerializer = result.getCorfuSMRProxy().getSerializer();
                                     if (smrObject.getSerializer() != objectSerializer) {
                                         log.warn("open: Attempt to open an existing object with a different serializer {}. " +
                                                         "Object {} opened with original serializer {}.",
@@ -161,6 +160,7 @@ public class SMRObject<T extends ICorfuSMR<T>> {
                                                 oid,
                                                 objectSerializer.getClass().getSimpleName());
                                     }
+                                    log.info("Added SMRObject {} to objectCache", oid);
                                     return result;
                                 } catch (Exception ex) {
                                     throw new UnrecoverableCorfuError(ex);
@@ -177,4 +177,7 @@ public class SMRObject<T extends ICorfuSMR<T>> {
         }
     }
 
+    public static <T extends ICorfuSMR<?>> Builder<T> builder() {
+        return new Builder<>();
+    }
 }

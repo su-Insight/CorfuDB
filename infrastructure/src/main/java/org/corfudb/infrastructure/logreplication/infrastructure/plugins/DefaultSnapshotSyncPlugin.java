@@ -1,6 +1,5 @@
 package org.corfudb.infrastructure.logreplication.infrastructure.plugins;
 
-import com.google.protobuf.StringValue;
 import lombok.extern.slf4j.Slf4j;
 import org.corfudb.runtime.CorfuRuntime;
 import org.corfudb.runtime.ExampleSchemas;
@@ -31,6 +30,9 @@ public class DefaultSnapshotSyncPlugin implements ISnapshotSyncPlugin {
     public static final UUID DEFAULT_UUID = UUID.fromString("00000000-0000-0000-0000-000000000000");
     public static final String ON_START_VALUE = "Hello I executed the start! Checkpoint is freezed!";
     public static final String ON_END_VALUE = "I executed the end! Checkpoint unfreezed, bye!";
+
+    public DefaultSnapshotSyncPlugin(CorfuRuntime runtime) {
+    }
 
     @Override
     public void onSnapshotSyncStart(CorfuRuntime runtime) {

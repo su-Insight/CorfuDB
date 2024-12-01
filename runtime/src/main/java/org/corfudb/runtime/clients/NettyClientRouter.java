@@ -18,7 +18,38 @@ import io.netty.handler.ssl.SslContext;
 import io.netty.handler.timeout.IdleState;
 import io.netty.handler.timeout.IdleStateEvent;
 import io.netty.handler.timeout.IdleStateHandler;
+import lombok.Builder;
+import lombok.Data;
+import lombok.Getter;
+import lombok.Setter;
+import lombok.extern.slf4j.Slf4j;
+import org.corfudb.protocols.CorfuProtocolCommon;
+import org.corfudb.protocols.service.CorfuProtocolMessage.ClusterIdCheck;
+import org.corfudb.protocols.service.CorfuProtocolMessage.EpochCheck;
+import org.corfudb.protocols.wireprotocol.ClientHandshakeHandler;
+import org.corfudb.protocols.wireprotocol.ClientHandshakeHandler.ClientHandshakeEvent;
+import org.corfudb.protocols.wireprotocol.NettyCorfuMessageDecoder;
+import org.corfudb.protocols.wireprotocol.NettyCorfuMessageEncoder;
+import org.corfudb.runtime.CorfuRuntime.CorfuRuntimeParameters;
+import org.corfudb.runtime.RuntimeParameters;
+import org.corfudb.runtime.exceptions.NetworkException;
+import org.corfudb.runtime.exceptions.unrecoverable.UnrecoverableCorfuError;
+import org.corfudb.runtime.exceptions.unrecoverable.UnrecoverableCorfuInterruptedError;
+import org.corfudb.runtime.proto.RpcCommon;
+import org.corfudb.runtime.proto.ServerErrors.ServerErrorMsg.ErrorCase;
+import org.corfudb.runtime.proto.service.CorfuMessage;
+import org.corfudb.runtime.proto.service.CorfuMessage.RequestPayloadMsg;
+import org.corfudb.runtime.proto.service.CorfuMessage.ResponseMsg;
+import org.corfudb.runtime.proto.service.CorfuMessage.ResponsePayloadMsg;
+import org.corfudb.security.sasl.SaslUtils;
+import org.corfudb.security.sasl.plaintext.PlainTextSaslNettyClient;
+import org.corfudb.security.tls.SslContextConstructor;
+import org.corfudb.util.CFUtils;
+import org.corfudb.util.NodeLocator;
+import org.corfudb.util.Sleep;
 
+import javax.annotation.Nonnull;
+import javax.net.ssl.SSLException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.EnumMap;
@@ -31,38 +62,9 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
-import javax.annotation.Nonnull;
-import javax.net.ssl.SSLException;
 
-import lombok.Getter;
-import lombok.Setter;
-import lombok.extern.slf4j.Slf4j;
-
-import org.corfudb.protocols.CorfuProtocolCommon;
-import org.corfudb.protocols.service.CorfuProtocolMessage.ClusterIdCheck;
-import org.corfudb.protocols.service.CorfuProtocolMessage.EpochCheck;
-import org.corfudb.protocols.wireprotocol.ClientHandshakeHandler;
-import org.corfudb.protocols.wireprotocol.ClientHandshakeHandler.ClientHandshakeEvent;
-import org.corfudb.protocols.wireprotocol.NettyCorfuMessageDecoder;
-import org.corfudb.protocols.wireprotocol.NettyCorfuMessageEncoder;
-import org.corfudb.runtime.CorfuRuntime.CorfuRuntimeParameters;
-import org.corfudb.runtime.exceptions.NetworkException;
-import org.corfudb.runtime.exceptions.unrecoverable.UnrecoverableCorfuError;
-import org.corfudb.runtime.exceptions.unrecoverable.UnrecoverableCorfuInterruptedError;
-import org.corfudb.runtime.proto.RpcCommon;
-import org.corfudb.runtime.proto.ServerErrors.ServerErrorMsg.ErrorCase;
-import org.corfudb.runtime.proto.service.CorfuMessage;
-import org.corfudb.runtime.proto.service.CorfuMessage.RequestPayloadMsg;
-import org.corfudb.runtime.proto.service.CorfuMessage.ResponseMsg;
-import org.corfudb.runtime.proto.service.CorfuMessage.ResponsePayloadMsg;
-import org.corfudb.runtime.RuntimeParameters;
-import org.corfudb.security.sasl.SaslUtils;
-import org.corfudb.security.sasl.plaintext.PlainTextSaslNettyClient;
-import org.corfudb.security.tls.SslContextConstructor;
-import org.corfudb.util.CFUtils;
-import org.corfudb.util.NodeLocator;
-import org.corfudb.util.Sleep;
-
+import static org.corfudb.common.util.URLUtils.getHostFromEndpointURL;
+import static org.corfudb.common.util.URLUtils.getPortFromEndpointURL;
 import static org.corfudb.protocols.CorfuProtocolCommon.DEFAULT_UUID;
 import static org.corfudb.protocols.CorfuProtocolCommon.getUuidMsg;
 import static org.corfudb.protocols.service.CorfuProtocolBase.getPingRequestMsg;
@@ -125,11 +127,12 @@ public class NettyClientRouter extends SimpleChannelInboundHandler<Object> imple
     /**
      * The outstanding requests on this router.
      */
-    public final Map<Long, CompletableFuture> outstandingRequests;
+    public final Map<Long, RequestMetadata> outstandingRequests;
 
     /**
      * The currently registered channel.
      */
+    @Getter
     private volatile Channel channel = null;
 
     /**
@@ -169,6 +172,13 @@ public class NettyClientRouter extends SimpleChannelInboundHandler<Object> imple
      */
     private final EventLoopGroup eventLoopGroup;
 
+    @Data
+    @Builder
+    public static class RequestMetadata {
+        CompletableFuture<?> future;
+        RequestPayloadMsg.PayloadCase payloadCase;
+    }
+
     /**
      * Creates a new NettyClientRouter connected to the specified host and port with the specified tls
      * and sasl options. The new {@link this} will attempt connection to the node until {@link
@@ -207,11 +217,12 @@ public class NettyClientRouter extends SimpleChannelInboundHandler<Object> imple
 
         if (parameters.isTlsEnabled()) {
             try {
-                sslContext = SslContextConstructor.constructSslContext(false,
-                        parameters.getKeyStore(),
-                        parameters.getKsPasswordFile(),
-                        parameters.getTrustStore(),
-                        parameters.getTsPasswordFile());
+                log.info("NettyClientRouter: constructSslContext for corfu client");
+                sslContext = SslContextConstructor.constructSslContext(
+                        false,
+                        parameters.getKeyStoreConfig(),
+                        parameters.getTrustStoreConfig()
+                );
             } catch (SSLException e) {
                 throw new UnrecoverableCorfuError(e);
             }
@@ -227,6 +238,8 @@ public class NettyClientRouter extends SimpleChannelInboundHandler<Object> imple
         parameters.getNettyChannelOptions().forEach(b::option);
         b.handler(getChannelInitializer());
         b.option(ChannelOption.CONNECT_TIMEOUT_MILLIS, (int) timeoutConnect);
+
+        log.info("Created a new NettyClientRouter with ID {}", parameters.getClientId());
 
         // Asynchronously connect, retrying until shut down.
         // Once connected, connectionFuture will be completed.
@@ -335,9 +348,9 @@ public class NettyClientRouter extends SimpleChannelInboundHandler<Object> imple
             // Remove the current completion future, forcing clients to wait for reconnection.
             connectionFuture = new CompletableFuture<>();
             // Exceptionally complete all requests that were waiting for a completion.
-            outstandingRequests.forEach((reqId, reqCompletableFuture) -> {
-                reqCompletableFuture.completeExceptionally(
-                        new NetworkException("Disconnected", node));
+            outstandingRequests.forEach((reqId, requestMetadata) -> {
+                requestMetadata.future.completeExceptionally(new NetworkException(
+                        String.format("Disconnected (%s)", requestMetadata.payloadCase), node));
                 // And also remove them.
                 outstandingRequests.remove(reqId);
             });
@@ -402,7 +415,20 @@ public class NettyClientRouter extends SimpleChannelInboundHandler<Object> imple
         shutdown = true;
         connectionFuture.completeExceptionally(new NetworkException("Router stopped", node));
         if (channel != null && channel.isOpen()) {
-            channel.close();
+            channel.close().syncUninterruptibly();
+        }
+    }
+
+    /**
+     * Reestablish the netty connection.
+     */
+    @Override
+    public void reconnect() {
+        // Close the channel and auto-trigger the reconnection callback.
+        log.info("NettyClientRouter reconnecting. Closing the existing channel.");
+        Channel channelCopy = channel;
+        if (channelCopy != null && channelCopy.isOpen()) {
+            channelCopy.close().syncUninterruptibly();
         }
     }
 
@@ -454,7 +480,11 @@ public class NettyClientRouter extends SimpleChannelInboundHandler<Object> imple
 
         // Generate a future and put it in the completion table.
         final CompletableFuture<T> cf = new CompletableFuture<>();
-        outstandingRequests.put(thisRequestId, cf);
+        outstandingRequests.put(thisRequestId,
+                RequestMetadata.builder()
+                        .future(cf)
+                        .payloadCase(request.getPayload().getPayloadCase())
+                        .build());
 
         // Write this message out on the channel
         channel.writeAndFlush(request, channel.voidPromise());
@@ -474,7 +504,8 @@ public class NettyClientRouter extends SimpleChannelInboundHandler<Object> imple
             if (e.getCause() instanceof TimeoutException) {
                 outstandingRequests.remove(thisRequestId);
                 log.debug(
-                        "sendRequestAndGetCompletable: Remove request {} to {} due to timeout! Request:{}",
+                        "sendRequestAndGetCompletable: Remove request (Type: {} ID: {}) to {} due to timeout! Request:{}",
+                        request.getPayload().getPayloadCase(),
                         thisRequestId, node, TextFormat.shortDebugString(request.getHeader()));
             }
             return null;
@@ -529,8 +560,9 @@ public class NettyClientRouter extends SimpleChannelInboundHandler<Object> imple
      * @param <T>        The type of the completion.
      */
     public <T> void completeRequest(long requestId, T completion) {
-        CompletableFuture<T> cf;
-        if ((cf = (CompletableFuture<T>) outstandingRequests.remove(requestId)) != null) {
+        RequestMetadata requestMetadata = outstandingRequests.remove(requestId);
+        if (requestMetadata != null) {
+            CompletableFuture<T> cf = (CompletableFuture<T>) requestMetadata.future;
             cf.complete(completion);
         } else {
             log.warn("Attempted to complete request {}, but request not outstanding!", requestId);
@@ -540,18 +572,20 @@ public class NettyClientRouter extends SimpleChannelInboundHandler<Object> imple
     /**
      * Exceptionally complete a request with a given cause.
      *
-     * @param requestID The request to complete.
+     * @param requestId The request to complete.
      * @param cause     The cause to give for the exceptional completion.
      */
-    public void completeExceptionally(long requestID, @Nonnull Throwable cause) {
-        CompletableFuture cf;
-        if ((cf = outstandingRequests.remove(requestID)) != null) {
-            cf.completeExceptionally(cause);
-            log.debug("completeExceptionally: Remove request {} to {} due to {}.", requestID, node,
+    public void completeExceptionally(long requestId, @Nonnull Throwable cause) {
+        RequestMetadata requestMetadata = outstandingRequests.remove(requestId);
+        if (requestMetadata != null) {
+            requestMetadata.future.completeExceptionally(cause);
+            log.debug("completeExceptionally: Remove request (Type: {} ID: {}) to {} due to {}.",
+                    requestMetadata.payloadCase,
+                    requestId, node,
                     cause.getClass().getSimpleName(), cause);
         } else {
             log.warn("Attempted to exceptionally complete request {}, but request not outstanding!",
-                    requestID);
+                    requestId);
         }
     }
 
@@ -663,7 +697,8 @@ public class NettyClientRouter extends SimpleChannelInboundHandler<Object> imple
      */
     @Deprecated
     public NettyClientRouter(String endpoint) {
-        this(endpoint.split(":")[0], Integer.parseInt(endpoint.split(":")[1]));
+        this(getHostFromEndpointURL(endpoint),
+                Integer.parseInt(getPortFromEndpointURL(endpoint)));
     }
 
     /**

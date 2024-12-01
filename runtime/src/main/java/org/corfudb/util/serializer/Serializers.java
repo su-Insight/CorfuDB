@@ -1,11 +1,11 @@
 package org.corfudb.util.serializer;
 
-import java.util.HashMap;
-import java.util.Map;
-
 import com.google.common.annotations.VisibleForTesting;
 import lombok.extern.slf4j.Slf4j;
 import org.corfudb.runtime.exceptions.SerializerException;
+
+import java.util.HashMap;
+import java.util.Map;
 
 
 /**
@@ -33,7 +33,7 @@ public class Serializers {
     private static final Map<Byte, ISerializer> serializersMap;
 
     static {
-        serializersMap = new HashMap();
+        serializersMap = new HashMap<>();
         serializersMap.put(CORFU.getType(), CORFU);
         serializersMap.put(JAVA.getType(), JAVA);
         serializersMap.put(JSON.getType(), JSON);
@@ -72,6 +72,7 @@ public class Serializers {
                     SYSTEM_SERIALIZERS_COUNT);
             throw new RuntimeException(msg);
         }
+        // clear MVOCache
     }
 
     /**

@@ -19,6 +19,40 @@ message SchemaOptions {
     repeated string stream_tag = 5;
     // Nested Secondary Key (repeated field)
     repeated SecondaryIndex secondary_key = 6;
+    // The combination of client and logical_group name to indicate how data is to be replicated.
+    optional ReplicationLogicalGroup replication_group = 7;
+}
+
+enum ConsistencyModel {
+    READ_YOUR_WRITES = 0;
+    READ_COMMITTED = 1;
+}
+
+enum SizeComputationModel {
+    ESTIMATE_NUM_KEYS = 0;
+    EXACT_SIZE = 1;
+}
+
+message PersistenceOptions {
+    optional string dataPath = 1;
+    optional ConsistencyModel consistencyModel = 2;
+    optional SizeComputationModel sizeComputationModel = 3;
+    optional int64 writeBufferSize = 4; // In bytes.
+    optional int32 blockCacheIndex = 5; // In bytes.
+
+    // Observability settings start at index 100.
+
+    // How often should RocksDB statistics be gathered.
+    // For example, 5 would indicate every 5th iteration.
+    optional uint32 reportingFrequency = 100;
+}
+
+message ReplicationLogicalGroup {
+    // Logical group name that helps club a number of tables into one group for Log Replication.
+    required string logical_group = 1;
+    // Client Name refers to the name of this replicated table's owner
+    // It can be used on the sink side of replication to apply or consume the incoming replicated updates.
+    required string client_name = 2;
 }
 
 message SecondaryIndex {

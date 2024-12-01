@@ -29,6 +29,7 @@ import java.util.function.BiPredicate;
 import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import static org.corfudb.runtime.collections.QueryOptions.DEFAULT_OPTIONS;
 
@@ -47,7 +48,7 @@ public class TxnContext implements AutoCloseable {
     private final TableRegistry tableRegistry;
     @Getter
     private final String namespace;
-    private final IsolationLevel isolationLevel;
+    private final Token txnSnapshot;
 
     private final List<CommitCallback> commitCallbacks;
 
@@ -73,17 +74,21 @@ public class TxnContext implements AutoCloseable {
         this.objectsView = objectsView;
         this.tableRegistry = tableRegistry;
         this.namespace = namespace;
-        this.isolationLevel = isolationLevel;
         this.commitCallbacks = new ArrayList<>();
         this.tablesUpdated = new HashMap<>();
-        txBeginInternal(allowNestedTransactions); // May throw exception if transaction was already started
+        this.txnSnapshot = txBeginInternal( // May throw exception if transaction was already started
+                allowNestedTransactions,
+                isolationLevel);
     }
 
     /**
      * @param allowNestedTransactions - is it ok to re-use thread's corfu transaction?
-     *                                Start the actual corfu transaction. Ensure there isn't one already in the same thread.
+     *                                Start the actual corfu transaction.
+     *                                Ensure there isn't one already in the same thread.
+     * @param isolationLevel - the requested snapshot to start transaction (or UNINITIALIZED if none)
+     * @return the snapshot Token of this transaction
      */
-    private void txBeginInternal(boolean allowNestedTransactions) {
+    private Token txBeginInternal(boolean allowNestedTransactions, IsolationLevel isolationLevel) {
         if (TransactionalContext.isInTransaction()) {
             TxnContext txnContext = TransactionalContext.getRootContext().getTxnContext();
             if (!allowNestedTransactions) {
@@ -95,18 +100,28 @@ public class TxnContext implements AutoCloseable {
             log.warn("Reusing the transactional context created outside this layer!");
             this.iDidNotStartCorfuTxn = true;
             TransactionalContext.getRootContext().setTxnContext(this);
-            return;
+            return TransactionalContext.getRootContext().getSnapshotTimestamp();
         }
 
         log.trace("TxnContext: begin transaction in namespace {}", namespace);
         Transaction.TransactionBuilder transactionBuilder = this.objectsView
                 .TXBuild()
                 .type(TransactionType.WRITE_AFTER_WRITE);
+        Token snapshotToken;
         if (isolationLevel.getTimestamp() != Token.UNINITIALIZED) {
             transactionBuilder.snapshot(isolationLevel.getTimestamp());
+            transactionBuilder.build().begin();
+            // Since transaction was requested at a particular snapshot
+            // return that as the transaction's snapshot address.
+            snapshotToken = new Token(isolationLevel.getTimestamp().getEpoch(),
+                    isolationLevel.getTimestamp().getSequence());
+        } else {
+            transactionBuilder.snapshot(isolationLevel.getTimestamp());
+            transactionBuilder.build().begin();
+            snapshotToken = TransactionalContext.getCurrentContext().getSnapshotTimestamp();
         }
-        transactionBuilder.build().begin();
         TransactionalContext.getRootContext().setTxnContext(this);
+        return snapshotToken;
     }
 
     public <K extends Message, V extends Message, M extends Message>
@@ -205,7 +220,11 @@ public class TxnContext implements AutoCloseable {
     }
 
     public long getEpoch() {
-        return isolationLevel.getTimestamp().getEpoch();
+        return txnSnapshot.getEpoch();
+    }
+
+    public long getTxnSequence() {
+        return txnSnapshot.getSequence();
     }
 
     /**
@@ -542,6 +561,17 @@ public class TxnContext implements AutoCloseable {
     }
 
     /**
+     * Gets all entries in the table in form of a stream.
+     *
+     * @param table - the table whose entrires are requested.
+     * @return stream of entries in the table
+     */
+    public <K extends Message, V extends Message, M extends Message>
+    Stream<CorfuStoreEntry<K, V, M>> entryStream(@Nonnull final Table<K, V, M> table) {
+        return table.entryStream();
+    }
+
+    /**
      * Get all the keys of a table just given its tableName.
      *
      * @param tableName fullyQualifiedTableName whose keys are requested.
@@ -755,8 +785,6 @@ public class TxnContext implements AutoCloseable {
 
         // CorfuStore should have only one transactional context since nesting is prohibited.
         AbstractTransactionalContext rootContext = TransactionalContext.getRootContext();
-        // Regardless of transaction outcome remove any TxnContext association from ThreadLocal.
-        rootContext.setTxnContext(null);
 
         long commitAddress = Address.NON_ADDRESS;
         if (iDidNotStartCorfuTxn) {
@@ -764,9 +792,6 @@ public class TxnContext implements AutoCloseable {
         } else {
             commitAddress = this.objectsView.TXEnd();
         }
-
-        // These can be moved to trace once stability improves.
-        log.trace("Txn committed on namespace {}", namespace);
 
         MultiObjectSMREntry writeSet = rootContext.getWriteSetInfo().getWriteSet();
         final Map<String, List<CorfuStreamEntry>> mutations = new HashMap<>(tablesUpdated.size());
@@ -800,8 +825,6 @@ public class TxnContext implements AutoCloseable {
      */
     public void txAbort() {
         if (TransactionalContext.isInTransaction()) {
-            // Regardless of transaction outcome remove any TxnContext association from ThreadLocal.
-            TransactionalContext.getRootContext().setTxnContext(null);
             this.objectsView.TXAbort();
         }
     }
@@ -814,14 +837,23 @@ public class TxnContext implements AutoCloseable {
     public void close() {
         if (TransactionalContext.isInTransaction()) {
             AbstractTransactionalContext rootContext = TransactionalContext.getRootContext();
-            rootContext.setTxnContext(null);
             log.trace("closing {} transaction without calling commit()!", rootContext);
-
             if (iDidNotStartCorfuTxn) {
                 log.warn("close() called on an inner transaction not started by CorfuStore");
             } else {
                 this.objectsView.TXAbort();
             }
         }
+    }
+
+    /**
+     * @param streamId - UUID of the stream
+     * @return Return the table name given the stream UUID
+     */
+    public String getTableNameFromUuid(UUID streamId) {
+        if (tablesUpdated.containsKey(streamId)) {
+            return tablesUpdated.get(streamId).getFullyQualifiedTableName();
+        }
+        return streamId.toString();
     }
 }

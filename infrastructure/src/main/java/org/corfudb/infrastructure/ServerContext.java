@@ -1,33 +1,16 @@
 package org.corfudb.infrastructure;
 
-import static org.corfudb.infrastructure.logreplication.LogReplicationConfig.DEFAULT_MAX_NUM_MSG_PER_BATCH;
-import static org.corfudb.infrastructure.logreplication.LogReplicationConfig.MAX_DATA_MSG_SIZE_SUPPORTED;
-import static org.corfudb.infrastructure.logreplication.LogReplicationConfig.MAX_CACHE_NUM_ENTRIES;
+import static org.corfudb.common.util.URLUtils.getVersionFormattedHostAddress;
 
 import com.google.common.collect.Sets;
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
 import io.netty.channel.EventLoopGroup;
-import java.io.File;
-import java.nio.file.Files;
-import java.time.Duration;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.Comparator;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
-import java.util.Set;
-import java.util.UUID;
-import java.util.concurrent.ThreadFactory;
-import java.util.concurrent.TimeUnit;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-import javax.annotation.Nonnull;
 import lombok.AccessLevel;
 import lombok.Getter;
 import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
 import org.corfudb.comm.ChannelImplementation;
+import org.corfudb.common.config.ConfigParamNames;
 import org.corfudb.infrastructure.datastore.DataStore;
 import org.corfudb.infrastructure.datastore.KvDataStore.KvRecord;
 import org.corfudb.infrastructure.paxos.PaxosDataStore;
@@ -43,8 +26,29 @@ import org.corfudb.util.NodeLocator;
 import org.corfudb.util.UuidUtils;
 import org.corfudb.utils.lock.Lock;
 
+import javax.annotation.Nonnull;
+import java.io.File;
+import java.nio.file.Files;
+import java.time.Duration;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import static org.corfudb.infrastructure.logreplication.LogReplicationConfig.DEFAULT_MAX_NUM_MSG_PER_BATCH;
+import static org.corfudb.infrastructure.logreplication.LogReplicationConfig.DEFAULT_MAX_SNAPSHOT_ENTRIES_APPLIED;
+import static org.corfudb.infrastructure.logreplication.LogReplicationConfig.MAX_CACHE_NUM_ENTRIES;
+import static org.corfudb.infrastructure.logreplication.LogReplicationConfig.DEFAULT_MAX_MSG_BATCH_SIZE;
 
 
 /**
@@ -85,7 +89,6 @@ public class ServerContext implements AutoCloseable {
 
     // Corfu Replication Server
     public static final String PLUGIN_CONFIG_FILE_PATH = "../resources/corfu_plugin_config.properties";
-
 
     /** The node Id, stored as a base64 string. */
     private static final String NODE_ID = "NODE_ID";
@@ -137,13 +140,15 @@ public class ServerContext implements AutoCloseable {
     private final EventLoopGroup clientGroup;
 
     @Getter
-    private final EventLoopGroup workerGroup;
+    private volatile EventLoopGroup workerGroup;
 
     @Getter (AccessLevel.PACKAGE)
-    private final NodeLocator nodeLocator;
+    @Setter
+    private NodeLocator nodeLocator;
 
     @Getter
-    private final String localEndpoint;
+    @Setter
+    private String localEndpoint;
 
     @Getter
     private final Set<String> dsFilePrefixesForCleanup =
@@ -173,9 +178,13 @@ public class ServerContext implements AutoCloseable {
             workerGroup = getNewWorkerGroup();
         }
 
-        nodeLocator = NodeLocator
-                .parseString(serverConfig.get("--address") + ":" + serverConfig.get("<port>"));
+        String hostAddress = getVersionFormattedHostAddress((String) serverConfig.get("--address"));
+        String address = hostAddress + ":" + serverConfig.get("<port>");
+        nodeLocator = NodeLocator.parseString(address);
         localEndpoint = nodeLocator.toEndpointUrl();
+
+        //TODO(Chetan): Remove this
+        log.debug("ServerContext: LocalEndpoint set as " + localEndpoint);
     }
 
     int getBaseServerThreadCount() {
@@ -191,6 +200,18 @@ public class ServerContext implements AutoCloseable {
     public int getManagementServerThreadCount() {
         Optional<String> threadCount = getServerConfig("--management-server-threads");
         return threadCount.map(Integer::parseInt).orElse(4);
+    }
+
+    public Optional<String> getCompactorConfig() {
+        return getServerConfig("--compactor-config");
+    }
+
+    public Optional<String> getCompactorScriptPath() {
+        return getServerConfig("--compactor-script");
+    }
+
+    public boolean getRunCompactorAsRoot() {
+        return (boolean) getServerConfig().get("--run-compactor-as-root");
     }
 
     public String getPluginConfigFilePath() {
@@ -223,6 +244,16 @@ public class ServerContext implements AutoCloseable {
     }
 
     /**
+     * Get a new ExecutorService backed by a cached thread pool.
+     * @param threadPrefix  The naming prefix
+     * @return The newly created ExecutorService
+     */
+    public static ExecutorService getCachedExecutorService(@Nonnull String threadPrefix) {
+        return Executors.newCachedThreadPool(
+                new ServerThreadFactory(threadPrefix, new ServerThreadFactory.ExceptionHandler()));
+    }
+
+    /**
      * Get the max number of messages can be sent over per batch.
      * @return
      */
@@ -250,7 +281,7 @@ public class ServerContext implements AutoCloseable {
      */
     public int getLogReplicationMaxDataMessageSize() {
         String val = getServerConfig(String.class, "--max-replication-data-message-size");
-        return val == null ? MAX_DATA_MSG_SIZE_SUPPORTED : Integer.parseInt(val);
+        return val == null ? DEFAULT_MAX_MSG_BATCH_SIZE : Integer.parseInt(val);
     }
 
     /**
@@ -261,6 +292,30 @@ public class ServerContext implements AutoCloseable {
     public int getLogReplicationCacheMaxSize() {
         String val = getServerConfig(String.class, "--lrCacheSize");
         return val == null ? MAX_CACHE_NUM_ENTRIES : Integer.parseInt(val);
+    }
+
+    /**
+     * Get the max write size of a transaction for LR's runtime.
+     * @return max write size of a transaction
+     */
+    public int getMaxWriteSize() {
+        String val = getServerConfig(String.class, "--max-replication-write-size");
+        return val == null ? Integer.MAX_VALUE : Integer.parseInt(val);
+    }
+
+    public int getMaxSnapshotEntriesApplied() {
+        String val = getServerConfig(String.class, "--max-snapshot-entries-applied");
+        return val == null ? DEFAULT_MAX_SNAPSHOT_ENTRIES_APPLIED : Integer.parseInt(val);
+    }
+
+    public int getSnapshotApplyWaitTime() {
+        String val = getServerConfig(String.class, "--wait-before-apply-ms");
+        return val == null ? 0 : Integer.parseInt(val);
+    }
+
+    public int getNegotiatingStateWaitTime() {
+        String val = getServerConfig(String.class, "--wait-in-negotiating-state-ms");
+        return val == null ? 0 : Integer.parseInt(val);
     }
 
     /**
@@ -323,19 +378,28 @@ public class ServerContext implements AutoCloseable {
      * @return an instance of {@link CorfuRuntimeParameters}
      */
     public CorfuRuntimeParameters getManagementRuntimeParameters() {
+        int checkpointTriggerFreqMs = 0;
+        if (serverConfig.get("--compaction-trigger-freq-ms") != null) {
+            checkpointTriggerFreqMs = Integer.parseInt((String)serverConfig.get("--compaction-trigger-freq-ms"));
+        }
         return CorfuRuntime.CorfuRuntimeParameters.builder()
                 .priorityLevel(PriorityLevel.HIGH)
                 .nettyEventLoop(clientGroup)
                 .shutdownNettyEventLoop(false)
                 .tlsEnabled((Boolean) serverConfig.get("--enable-tls"))
-                .keyStore((String) serverConfig.get("--keystore"))
-                .ksPasswordFile((String) serverConfig.get("--keystore-password-file"))
-                .trustStore((String) serverConfig.get("--truststore"))
-                .tsPasswordFile((String) serverConfig.get("--truststore-password-file"))
+                .keyStore((String) serverConfig.get(ConfigParamNames.KEY_STORE))
+                .ksPasswordFile((String) serverConfig.get(ConfigParamNames.KEY_STORE_PASS_FILE))
+                .trustStore((String) serverConfig.get(ConfigParamNames.TRUST_STORE))
+                .tsPasswordFile((String) serverConfig.get(ConfigParamNames.TRUST_STORE_PASS_FILE))
                 .saslPlainTextEnabled((Boolean) serverConfig.get("--enable-sasl-plain-text-auth"))
                 .usernameFile((String) serverConfig.get("--sasl-plain-text-username-file"))
                 .passwordFile((String) serverConfig.get("--sasl-plain-text-password-file"))
+                // Disable FileWatcher for management client as when the certs are changed,
+                // server already re-initializes the connections
+                .disableFileWatcher(true)
                 .bulkReadSize(Integer.parseInt((String) serverConfig.get("--batch-size")))
+                .clientName("CorfuServer")
+                .checkpointTriggerFreqMillis(checkpointTriggerFreqMs)
                 .build();
     }
 
@@ -343,13 +407,13 @@ public class ServerContext implements AutoCloseable {
      * Generate a Node Id if not present.
      */
     private void generateNodeId() {
-        String currentId = getDataStore().get(NODE_ID_RECORD);
-        if (currentId == null) {
+        Optional<String> currentId = getDataStore().find(NODE_ID_RECORD);
+        if (currentId.isPresent()) {
+            log.info("Node Id = {}", currentId);
+        } else {
             String idString = UuidUtils.asBase64(UUID.randomUUID());
             log.info("No Node Id, setting to new Id={}", idString);
             getDataStore().put(NODE_ID_RECORD, idString);
-        } else {
-            log.info("Node Id = {}", currentId);
         }
     }
 
@@ -402,7 +466,7 @@ public class ServerContext implements AutoCloseable {
      *  @return True, if a new layout was installed, false otherwise.
      */
     public synchronized boolean installSingleNodeLayoutIfAbsent() {
-        if (isSingleNodeSetup() && getCurrentLayout() == null) {
+        if (isSingleNodeSetup() && !findCurrentLayout().isPresent()) {
             setCurrentLayout(getNewSingleNodeLayout());
             return true;
         }
@@ -414,7 +478,10 @@ public class ServerContext implements AutoCloseable {
      * @return True if it is, false otherwise.
      */
     public boolean isSingleNodeSetup(){
-        return (Boolean) getServerConfig().get("--single");
+        return Optional
+                .ofNullable(getServerConfig().get("--single"))
+                .map(single -> Boolean.parseBoolean(single.toString()))
+                .orElse(false);
     }
 
     /**
@@ -438,10 +505,12 @@ public class ServerContext implements AutoCloseable {
                 clusterId = UuidUtils.fromBase64(clusterIdString);
             }
         }
-        log.info("getNewSingleNodeLayout: Bootstrapping with cluster Id {} [{}]",
-            clusterId, UuidUtils.asBase64(clusterId));
-        String localAddress = getServerConfig().get("--address") + ":"
-            + getServerConfig().get("<port>");
+
+        String localAddress = getNodeLocator().toEndpointUrl();
+
+        log.info("getNewSingleNodeLayout: Bootstrapping with cluster Id {} [{}], localAddress {}",
+            clusterId, UuidUtils.asBase64(clusterId), localAddress);
+
         return new Layout(
             Collections.singletonList(localAddress),
             Collections.singletonList(localAddress),
@@ -458,6 +527,10 @@ public class ServerContext implements AutoCloseable {
             0L,
             clusterId
         );
+    }
+
+    public Optional<Layout> findCurrentLayout() {
+        return Optional.ofNullable(getCurrentLayout());
     }
 
     /**
@@ -491,8 +564,7 @@ public class ServerContext implements AutoCloseable {
      * The epoch of this router. This is managed by the base server implementation.
      */
     public synchronized long getServerEpoch() {
-        Long epoch = dataStore.get(SERVER_EPOCH_RECORD);
-        return epoch == null ? Layout.INVALID_EPOCH : epoch;
+        return dataStore.get(SERVER_EPOCH_RECORD, Layout.INVALID_EPOCH);
     }
 
     /**
@@ -536,8 +608,8 @@ public class ServerContext implements AutoCloseable {
      * @return Sequencer epoch.
      */
     public long getSequencerEpoch() {
-        Long epoch = dataStore.get(SEQUENCER_RECORD);
-        return epoch == null ? Layout.INVALID_EPOCH : epoch;
+        return dataStore
+                .get(SEQUENCER_RECORD, Layout.INVALID_EPOCH);
     }
 
     /**
@@ -606,6 +678,41 @@ public class ServerContext implements AutoCloseable {
         } else {
             return null;
         }
+    }
+
+    /**
+     * Shuts down the workerGroup and spawns a new one
+     */
+    public void refreshWorkerGroupThreads() {
+        CorfuRuntime.CorfuRuntimeParameters params = getManagementRuntimeParameters();
+
+        workerGroup.shutdownGracefully(
+                params.getNettyShutdownQuitePeriod(),
+                params.getNettyShutdownTimeout(),
+                TimeUnit.MILLISECONDS
+        );
+
+        try {
+            // Wait a while for existing tasks to terminate
+            if (!workerGroup.awaitTermination(params.getNettyShutdownTimeout(), TimeUnit.MILLISECONDS)) {
+                log.error("refreshWorkerGroup: Executor Pool workerGroup did not terminate.");
+            } else {
+                log.info("refreshWorkerGroup: Executor Pool workerGroup terminated successfully.");
+            }
+        } catch (InterruptedException ie) {
+            // (Re-)Cancel if current thread also interrupted
+            workerGroup.shutdownNow();
+            // Preserve interrupt status on the current thread
+            Thread.currentThread().interrupt();
+        }
+
+        log.info("refreshWorkerGroup: Creating new workerGroup threads. workerGroup current state:" +
+                        " isShuttingDown {}, isShutdown {}, isTerminated {}.",
+                workerGroup.isShuttingDown(),
+                workerGroup.isShutdown(),
+                workerGroup.isTerminated());
+
+        workerGroup = getNewWorkerGroup();
     }
 
     /**

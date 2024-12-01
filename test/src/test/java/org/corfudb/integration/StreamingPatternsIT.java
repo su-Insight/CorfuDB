@@ -1,10 +1,10 @@
 package org.corfudb.integration;
 
 import com.google.common.collect.Iterables;
-import com.google.common.reflect.TypeToken;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 import org.corfudb.protocols.wireprotocol.Token;
+import org.corfudb.runtime.CorfuRuntime;
 import org.corfudb.runtime.CorfuStoreMetadata.Timestamp;
 import org.corfudb.runtime.MultiCheckpointWriter;
 import org.corfudb.runtime.collections.CorfuRecord;
@@ -12,18 +12,18 @@ import org.corfudb.runtime.collections.CorfuStore;
 import org.corfudb.runtime.collections.CorfuStoreEntry;
 import org.corfudb.runtime.collections.CorfuStreamEntries;
 import org.corfudb.runtime.collections.CorfuStreamEntry;
-import org.corfudb.runtime.collections.CorfuTable;
+import org.corfudb.runtime.collections.PersistentCorfuTable;
 import org.corfudb.runtime.collections.StreamListenerResumeOrDefault;
 import org.corfudb.runtime.collections.StreamListenerResumeOrFullSync;
 import org.corfudb.runtime.collections.Table;
 import org.corfudb.runtime.collections.TableOptions;
 import org.corfudb.runtime.collections.TxnContext;
 import org.corfudb.runtime.view.TableRegistry;
-import org.corfudb.test.SampleSchema.ManagedResources;
 import org.corfudb.test.SampleSchema.EventInfo;
-import org.corfudb.test.SampleSchema.Uuid;
+import org.corfudb.test.SampleSchema.ManagedResources;
 import org.corfudb.test.SampleSchema.SampleTableAMsg;
 import org.corfudb.test.SampleSchema.SampleTableBMsg;
+import org.corfudb.test.SampleSchema.Uuid;
 import org.junit.Before;
 import org.junit.Test;
 
@@ -270,7 +270,7 @@ public class StreamingPatternsIT extends AbstractIT {
     @Test
     public void testDefaultPortionOfResumeOrDefaultPolicy() throws Exception {
         // Run a corfu server & initialize CorfuStore
-        initializeCorfu();
+        CorfuRuntime runtime = initializeCorfu();
 
         // Record initial timestamp, to subscribe from the start of the log
         Timestamp startLog = Timestamp.newBuilder().setEpoch(0L).setSequence(-1L).build();
@@ -292,20 +292,19 @@ public class StreamingPatternsIT extends AbstractIT {
 
         do {
             // Wait until latch has decreased by '1' (error is triggered)
+            TimeUnit.MILLISECONDS.sleep(100);
         } while (errorLatch.getCount() != 1);
 
         assertThat(defaultStreamListener.getUpdates()).hasSize(numUpdates - deltaToError);
 
         // Trim the log on the last processed entry + delta, to confirm it is not able to resume and it runs the
         // default policy (skipping several entries)
-        MultiCheckpointWriter<CorfuTable> mcw = new MultiCheckpointWriter<>();
+        MultiCheckpointWriter<PersistentCorfuTable<?, ?>> mcw = new MultiCheckpointWriter<>();
         List<String> tablesToCheckpoint = Arrays.asList(defaultTableName);
         tablesToCheckpoint.forEach(tableName -> {
-            CorfuTable<Uuid, CorfuRecord<EventInfo, ManagedResources>> corfuTable = runtime.getObjectsView().build()
-                    .setTypeToken(new TypeToken<CorfuTable<Uuid, CorfuRecord<EventInfo, ManagedResources>>>() {
-                    })
-                    .setStreamName(TableRegistry.getFullyQualifiedTableName(namespace, tableName))
-                    .open();
+            PersistentCorfuTable<Uuid, CorfuRecord<EventInfo, ManagedResources>> corfuTable =
+                    createCorfuTable(runtime, TableRegistry.getFullyQualifiedTableName(namespace, tableName));
+
             mcw.addMap(corfuTable);
         });
 
@@ -407,7 +406,7 @@ public class StreamingPatternsIT extends AbstractIT {
     @SuppressWarnings("checkstyle:magicnumber")
     public void testFullSyncPortionOfResumeOrFullSyncPolicy() throws Exception {
         // Run a corfu server & initialize CorfuStore
-        initializeCorfu();
+        CorfuRuntime runtime = initializeCorfu();
 
         // Record initial timestamp, to subscribe from the start of the log
         Timestamp startLog = Timestamp.newBuilder().setEpoch(0L).setSequence(-1L).build();
@@ -439,14 +438,12 @@ public class StreamingPatternsIT extends AbstractIT {
 
         // Trim the log on the last processed entry + delta, to confirm it is not able to resume and it runs the
         // default policy (skipping several entries)
-        MultiCheckpointWriter<CorfuTable> mcw = new MultiCheckpointWriter<>();
+        MultiCheckpointWriter<PersistentCorfuTable<?, ?>> mcw = new MultiCheckpointWriter<>();
         List<String> tablesToCheckpoint = Arrays.asList(defaultTableName);
         tablesToCheckpoint.forEach(tableName -> {
-            CorfuTable<Uuid, CorfuRecord<EventInfo, ManagedResources>> corfuTable = runtime.getObjectsView().build()
-                    .setTypeToken(new TypeToken<CorfuTable<Uuid, CorfuRecord<EventInfo, ManagedResources>>>() {
-                    })
-                    .setStreamName(TableRegistry.getFullyQualifiedTableName(namespace, tableName))
-                    .open();
+            PersistentCorfuTable<Uuid, CorfuRecord<EventInfo, ManagedResources>> corfuTable =
+                    createCorfuTable(runtime, TableRegistry.getFullyQualifiedTableName(namespace, tableName));
+
             mcw.addMap(corfuTable);
         });
 
@@ -489,7 +486,7 @@ public class StreamingPatternsIT extends AbstractIT {
     @Test
     public void testFullSyncFailureOfResumeOrFullSyncPolicy() throws Exception {
         // Run a corfu server & initialize CorfuStore
-        initializeCorfu();
+        CorfuRuntime runtime = initializeCorfu();
 
         // Record initial timestamp, to subscribe from the start of the log
         Timestamp startLog = Timestamp.newBuilder().setEpoch(0L).setSequence(-1L).build();
@@ -519,14 +516,12 @@ public class StreamingPatternsIT extends AbstractIT {
 
         // Trim the log on the last processed entry + delta, to confirm it is not able to resume and it runs the
         // default policy (skipping several entries)
-        MultiCheckpointWriter<CorfuTable> mcw = new MultiCheckpointWriter<>();
+        MultiCheckpointWriter<PersistentCorfuTable<?, ?>> mcw = new MultiCheckpointWriter<>();
         List<String> tablesToCheckpoint = Arrays.asList(defaultTableName);
         tablesToCheckpoint.forEach(tableName -> {
-            CorfuTable<Uuid, CorfuRecord<EventInfo, ManagedResources>> corfuTable = runtime.getObjectsView().build()
-                    .setTypeToken(new TypeToken<CorfuTable<Uuid, CorfuRecord<EventInfo, ManagedResources>>>() {
-                    })
-                    .setStreamName(TableRegistry.getFullyQualifiedTableName(namespace, tableName))
-                    .open();
+            PersistentCorfuTable<Uuid, CorfuRecord<EventInfo, ManagedResources>> corfuTable =
+                    createCorfuTable(runtime, TableRegistry.getFullyQualifiedTableName(namespace, tableName));
+
             mcw.addMap(corfuTable);
         });
 
@@ -589,12 +584,15 @@ public class StreamingPatternsIT extends AbstractIT {
     /**
      * A helper method to initialize a Corfu Server, Corfu Runtime and Corfu Store instance.
      *
-     * @throws Exception
+     * @return corfu runtime
+     * @throws Exception error
      */
-    private void initializeCorfu() throws Exception {
+    private CorfuRuntime initializeCorfu() throws Exception {
         corfuServer = runSinglePersistentServer(corfuSingleNodeHost, corfuStringNodePort);
-        runtime = createRuntime(singleNodeEndpoint);
+        CorfuRuntime runtime = createRuntime(singleNodeEndpoint);
         store = new CorfuStore(runtime);
+
+        return runtime;
     }
 
     /**
@@ -609,5 +607,4 @@ public class StreamingPatternsIT extends AbstractIT {
                 .setSingle(true)
                 .runServer();
     }
-
 }

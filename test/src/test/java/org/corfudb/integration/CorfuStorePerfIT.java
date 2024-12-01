@@ -1,48 +1,53 @@
 package org.corfudb.integration;
 
 
+import com.google.common.reflect.TypeToken;
+import org.apache.commons.io.FileUtils;
+import org.corfudb.runtime.CorfuRuntime;
+import org.corfudb.runtime.collections.CorfuStore;
+import org.corfudb.runtime.collections.ICorfuTable;
+import org.corfudb.runtime.collections.PersistentCorfuTable;
+import org.corfudb.runtime.collections.Table;
+import org.corfudb.runtime.collections.TableOptions;
+import org.corfudb.runtime.collections.TxnContext;
+import org.corfudb.test.SampleSchema;
+import org.corfudb.test.SampleSchema.EventInfo;
+import org.corfudb.test.SampleSchema.ManagedResources;
+import org.corfudb.test.SampleSchema.Uuid;
+import org.junit.jupiter.api.Test;
+
 import java.lang.reflect.InvocationTargetException;
 import java.nio.file.FileStore;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 import java.util.UUID;
-
-import com.google.common.reflect.TypeToken;
-import org.apache.commons.io.FileUtils;
-
-import org.corfudb.runtime.collections.TxnContext;
-import org.junit.jupiter.api.Test;
-
-import org.corfudb.runtime.CorfuRuntime;
-import org.corfudb.runtime.CorfuStoreMetadata;
-import org.corfudb.runtime.collections.CorfuStore;
-import org.corfudb.runtime.collections.CorfuTable;
-import org.corfudb.runtime.collections.Table;
-import org.corfudb.runtime.collections.TableOptions;
-import org.corfudb.test.SampleSchema;
-import org.corfudb.test.SampleSchema.ManagedResources;
-import org.corfudb.test.SampleSchema.Uuid;
-import org.corfudb.test.SampleSchema.EventInfo;
 
 import static org.assertj.core.api.Assertions.assertThat;
 /**
  * Simple performance test to insert data into corfu via regular table.put() and CorfuStore protobufs
  */
-public class CorfuStorePerfIT extends  AbstractIT {
+public class CorfuStorePerfIT extends AbstractIT {
 
     @Test
     public void corfuStorePerfComparisonTest() throws Exception {
-        long maxLogSize = FileUtils.ONE_MB / 2;
-        Process server1 = runServerWithQuota(DEFAULT_PORT, maxLogSize,
-            true);
+        Process server1 = null;
+        CorfuRuntime rt = null;
+        try {
+            long maxLogSize = FileUtils.ONE_MB / 2;
+            server1 = runServerWithQuota(DEFAULT_PORT, maxLogSize,
+                    true);
 
-        CorfuRuntime rt = new CorfuRuntime(DEFAULT_ENDPOINT).connect();
-        final int count = 100;
-        addObjectsToTable(rt, count);
-        addProtoToStore(rt, count);
+            rt = new CorfuRuntime(DEFAULT_ENDPOINT).connect();
+            final int count = 100;
+            addObjectsToTable(rt, count);
+            addProtoToStore(rt, count);
+        } finally {
+            rt.shutdown();
+            assertThat(shutdownCorfuServer(server1)).isTrue();
+        }
+
     }
 
     private final static int randomPort = 8000;
@@ -52,10 +57,10 @@ public class CorfuStorePerfIT extends  AbstractIT {
     private void addObjectsToTable(CorfuRuntime rt, final int count) {
         System.out.println("Start Writing Java Obj" + System.currentTimeMillis());
         long start = System.currentTimeMillis();
-        Map<UUID, Event> map = rt.getObjectsView()
+        ICorfuTable<UUID, Event> map = rt.getObjectsView()
             .build()
             .setStreamName("s1")
-            .setTypeToken(new TypeToken<CorfuTable<UUID, Event>>() {})
+            .setTypeToken(new TypeToken<PersistentCorfuTable<UUID, Event>>() {})
             .open();
 
         Event event;
@@ -64,7 +69,7 @@ public class CorfuStorePerfIT extends  AbstractIT {
                 eventTime, randomFreq
             );
             rt.getObjectsView().TXBegin();
-            map.put(UUID.randomUUID(), event);
+            map.insert(UUID.randomUUID(), event);
             rt.getObjectsView().TXEnd();
         }
         long end = System.currentTimeMillis();

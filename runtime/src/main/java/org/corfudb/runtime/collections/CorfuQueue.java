@@ -1,21 +1,10 @@
 package org.corfudb.runtime.collections;
 
-import static com.google.common.base.Preconditions.checkState;
-
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.reflect.TypeToken;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.InvalidProtocolBufferException;
-
 import io.netty.buffer.ByteBuf;
-import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
-import java.util.function.Supplier;
-import java.util.stream.Collectors;
 import lombok.AllArgsConstructor;
 import lombok.Getter;
 import lombok.Setter;
@@ -29,6 +18,16 @@ import org.corfudb.runtime.view.CorfuGuidGenerator;
 import org.corfudb.util.serializer.ICorfuHashable;
 import org.corfudb.util.serializer.ISerializer;
 import org.corfudb.util.serializer.Serializers;
+
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.stream.Collectors;
+
+import static com.google.common.base.Preconditions.checkState;
 
 /**
  * Persisted Queue supported by CorfuDB using distributed State Machine Replication.
@@ -49,19 +48,17 @@ public class CorfuQueue {
     /**
      * The main CorfuTable which contains the primary key-value mappings.
      */
-    private final CorfuTable<CorfuRecordId, ByteString> corfuTable;
+    private final PersistentCorfuTable<CorfuRecordId, ByteString> corfuTable;
     private final CorfuGuidGenerator guidGenerator;
 
     @VisibleForTesting
     CorfuQueue(CorfuRuntime runtime, String streamName, ISerializer serializer) {
-        final Supplier<StreamingMap<CorfuRecordId, ByteString>> mapSupplier =
-                () -> new StreamingMapDecorator<>(new LinkedHashMap<CorfuRecordId, ByteString>());
         corfuTable = runtime.getObjectsView().build()
-                .setTypeToken(new TypeToken<CorfuTable<CorfuRecordId, ByteString>>() {})
+                .setTypeToken(new TypeToken<PersistentCorfuTable<CorfuRecordId, ByteString>>() {})
                 .setStreamName(streamName)
-                .setArguments(Index.Registry.empty(), mapSupplier)
                 .setSerializer(serializer)
                 .open();
+
         guidGenerator = CorfuGuidGenerator.getInstance(runtime);
     }
 
@@ -237,7 +234,7 @@ public class CorfuQueue {
          log.trace("enqueue: Adding preCommitListener for Queue: " + id.toString());
          TransactionalContext.getRootContext().addPreCommitListener(addressGetter);
 
-         corfuTable.put(id, e);
+         corfuTable.insert(id, e);
          return id;
     }
 
@@ -315,8 +312,9 @@ public class CorfuQueue {
         Comparator<Map.Entry<CorfuRecordId, ByteString>> recordIdComparator = Comparator.comparing(Map.Entry::getKey);
         for (Map.Entry<CorfuRecordId, ByteString> entry : corfuTable.entryStream()
                 .filter(e -> e.getKey().compareTo(entriesAfter) > 0)
+                .sorted(recordIdComparator)
                 .limit(maxEntries)
-                .sorted(recordIdComparator).collect(Collectors.toList())) {
+                .collect(Collectors.toList())) {
             copy.add(new CorfuQueueRecord(entry.getKey(), entry.getValue()));
         }
         return copy;
@@ -359,8 +357,8 @@ public class CorfuQueue {
      *
      * @return The entry that was successfully removed or null if there was no mapping.
      */
-    public ByteString removeEntry(CorfuRecordId entryId) {
-        return corfuTable.remove(entryId);
+    public void removeEntry(CorfuRecordId entryId) {
+        corfuTable.delete(entryId);
     }
 
     /**
@@ -381,9 +379,12 @@ public class CorfuQueue {
     public String toString(){
         StringBuilder stringBuilder = new StringBuilder(corfuTable.size());
         stringBuilder.append("{");
-        for (Map.Entry<CorfuRecordId, ByteString> entry : corfuTable.entrySet()) {
+
+        for (Iterator<Map.Entry<CorfuRecordId, ByteString>> it = corfuTable.entryStream().iterator(); it.hasNext(); ) {
+            Map.Entry<CorfuRecordId, ByteString> entry = it.next();
             stringBuilder.append(entry.toString()).append(", ");
         }
+
         stringBuilder.append("}");
         return stringBuilder.toString();
     }

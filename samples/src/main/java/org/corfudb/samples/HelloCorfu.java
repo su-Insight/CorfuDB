@@ -1,12 +1,13 @@
 package org.corfudb.samples;
 
-import java.util.Map;
-
 import com.google.common.reflect.TypeToken;
 import org.corfudb.runtime.CorfuRuntime;
-import org.corfudb.runtime.collections.CorfuTable;
+import org.corfudb.runtime.collections.ICorfuTable;
+import org.corfudb.runtime.collections.PersistentCorfuTable;
 import org.corfudb.util.GitRepositoryState;
 import org.docopt.Docopt;
+
+import java.util.Map;
 
 /**
  * This tutorial demonstrates a simple Corfu application.
@@ -26,7 +27,6 @@ public class HelloCorfu {
      * @return a CorfuRuntime object, with which Corfu applications perform all Corfu operations
      */
     private static CorfuRuntime getRuntimeAndConnect(String configurationString) {
-
         CorfuRuntime corfuRuntime = new CorfuRuntime(configurationString).connect();
         return corfuRuntime;
     }
@@ -60,10 +60,10 @@ public class HelloCorfu {
          * We will instantiate a stream by giving it a name "A",
          * and then instantiate an object by specifying its class
          */
-        Map<String, Integer> map = runtime.getObjectsView()
+        ICorfuTable<String, Integer> map = runtime.getObjectsView()
                 .build()
                 .setStreamName("A")     // stream name
-                .setTypeToken(new TypeToken<CorfuTable<String, Integer>>() {})
+                .setTypeToken(new TypeToken<PersistentCorfuTable<String, Integer>>() {})
                 .open();                // instantiate the object!
 
         /**
@@ -78,10 +78,10 @@ public class HelloCorfu {
          Integer previous = map.get("a");
          if (previous == null) {
              System.out.println("This is the first time we were run!");
-             map.put("a", 1);
+             map.insert("a", 1);
          }
          else {
-             map.put("a", ++previous);
+             map.insert("a", ++previous);
              System.out.println("This is the " + previous + " time we were run!");
          }
     }

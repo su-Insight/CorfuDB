@@ -36,6 +36,9 @@ public class CorfuServerParams implements NodeParams {
     private final int port = ServerUtil.getRandomOpenPort();
 
     @Default
+    private final int healthPort = ServerUtil.getRandomOpenPort();
+
+    @Default
     @NonNull
     private final Mode mode = Mode.CLUSTER;
 
@@ -62,11 +65,11 @@ public class CorfuServerParams implements NodeParams {
     @EqualsAndHashCode.Exclude
     private final Duration stopTimeout = Duration.ofSeconds(1);
 
-    @Default
-    private final Optional<ContainerResources> containerResources = Optional.empty();
+    @NonNull
+    private final ContainerResources containerResources;
 
     /**
-     * Corfu server version, for instance: 0.3.0-SNAPSHOT
+     * Corfu server version, for instance: 0.0.0.0-SNAPSHOT
      */
     @NonNull
     private final String serverVersion;
@@ -98,11 +101,11 @@ public class CorfuServerParams implements NodeParams {
 
     @Override
     public Set<Integer> getPorts() {
-        return ImmutableSet.of(port);
+        return ImmutableSet.of(port, healthPort);
     }
 
     public String getDockerImageNameFullName() {
-        return dockerImage + ":" + serverVersion;
+        return (dockerImage + ":" + serverVersion).trim();
     }
 
     public Path getInfrastructureJar() {
@@ -116,6 +119,8 @@ public class CorfuServerParams implements NodeParams {
      */
     @Builder
     @ToString
+    @EqualsAndHashCode
+    @SuppressWarnings("OptionalUsedAsFieldOrParameterType")
     public static class ContainerResources {
 
         /**
@@ -123,6 +128,6 @@ public class CorfuServerParams implements NodeParams {
          */
         @Getter
         @Default
-        private final long memory = 1048 * 1024 * 1024;
+        private final Optional<Long> memory = Optional.of(1048L * 1024 * 1024);
     }
 }

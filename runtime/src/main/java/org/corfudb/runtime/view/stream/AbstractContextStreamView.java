@@ -1,18 +1,18 @@
 package org.corfudb.runtime.view.stream;
 
-import java.util.ArrayList;
-import java.util.List;
-import java.util.NavigableSet;
-import java.util.TreeSet;
-import java.util.UUID;
-import java.util.function.BiFunction;
-import java.util.function.Function;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 import org.corfudb.protocols.wireprotocol.ILogData;
 import org.corfudb.runtime.CorfuRuntime;
 import org.corfudb.runtime.view.Address;
 import org.corfudb.util.Utils;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.NavigableSet;
+import java.util.TreeSet;
+import java.util.UUID;
+import java.util.function.BiFunction;
 
 
 /** An abstract context stream view maintains contexts, which are used to
@@ -134,10 +134,11 @@ public abstract class AbstractContextStreamView<T extends AbstractStreamContext>
             // Update the pointer.
             updatePointer(entry);
 
-            // We added hole to StreamView layer, in order to enable VLO sync to a hole
-            // and in this way, we can avoid unnecessary sync that call sequencer every time.
-            // It can expose a hole to sv consumer, so check if entry is a hole.
-            if (entry.isHole()) {
+            // If we see a hole that doesn't have a backpointer that belongs to this
+            // stream then it can be skipped. Otherwise, holes that do belong to this
+            // stream (i.e., written by the checkpointer) will be returned and not skipped.
+            // Higher layers can interpret this hole as a no-op
+            if (entry.isHole() && entry.getBackpointerMap().isEmpty()) {
                 return nextUpTo(maxGlobal);
             }
         }

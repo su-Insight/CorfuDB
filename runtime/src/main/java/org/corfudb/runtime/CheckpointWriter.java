@@ -15,14 +15,13 @@ import org.corfudb.protocols.wireprotocol.DataType;
 import org.corfudb.protocols.wireprotocol.LogData;
 import org.corfudb.protocols.wireprotocol.Token;
 import org.corfudb.protocols.wireprotocol.TokenResponse;
-import org.corfudb.runtime.collections.StreamingMap;
+import org.corfudb.runtime.collections.ICorfuTable;
 import org.corfudb.runtime.object.transactions.TransactionType;
 import org.corfudb.runtime.view.CacheOption;
 import org.corfudb.runtime.view.StreamsView;
 import org.corfudb.runtime.view.TableRegistry;
 import org.corfudb.util.serializer.DynamicProtobufSerializer;
 import org.corfudb.util.serializer.ISerializer;
-import org.corfudb.util.serializer.ProtobufSerializer;
 import org.corfudb.util.serializer.Serializers;
 
 import java.nio.ByteBuffer;
@@ -32,6 +31,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.function.BiConsumer;
@@ -46,7 +46,7 @@ import java.util.stream.Stream;
  *  TODO: Generalize to all SMR objects.
  */
 @Slf4j
-public class CheckpointWriter<T extends StreamingMap> {
+public class CheckpointWriter<T extends ICorfuTable<?, ?>> {
     /** Metadata to be stored in the CP's 'dict' map.
      */
     private final UUID streamId;
@@ -57,8 +57,8 @@ public class CheckpointWriter<T extends StreamingMap> {
     private long numEntries = 0;
     private long numBytes = 0;
 
-    /** Creates a batch that is 95% of the the max write size to accommodate for metadata overhead
-     *  metadata overhead is the size of an empty CheckpointEntry. This parameter also helps to
+    /** Creates a batch that is 95% of the max write size to accommodate for metadata overhead.
+     *  Metadata overhead is the size of an empty CheckpointEntry. This parameter also helps to
      *  tune to the number of smr entries per CONTINUATION record of the checkpoint entry.
      */
     @Setter
@@ -71,6 +71,13 @@ public class CheckpointWriter<T extends StreamingMap> {
     @Getter
     @Setter
     private int batchSize;
+
+    /**
+     *  Max uncompressed checkpoint entry size: Maximum uncompressed size of a single Checkpoint CONTINUATION Entry.
+     */
+    @Getter
+    @Setter
+    private long maxUncompressedCpEntrySize;
 
     @SuppressWarnings("checkstyle:abbreviation")
     private final UUID checkpointStreamID;
@@ -107,7 +114,8 @@ public class CheckpointWriter<T extends StreamingMap> {
     /** Local ref to the object that we're dumping.
      *  TODO: generalize to all SMR objects.
      */
-    private final T map;
+    @Getter
+    private final T corfuTable;
 
     @Getter
     @Setter
@@ -117,16 +125,17 @@ public class CheckpointWriter<T extends StreamingMap> {
      * @param rt object's runtime
      * @param streamId unique identifier of stream to checkpoint
      * @param author checkpoint initiator
-     * @param map local reference of the map to checkpoint
+     * @param corfuTable local reference of the PersistentCorfuTable to checkpoint
      */
-    public CheckpointWriter(CorfuRuntime rt, UUID streamId, String author, T map) {
+    public CheckpointWriter(CorfuRuntime rt, UUID streamId, String author, T corfuTable) {
         this.rt = rt;
         this.streamId = streamId;
         this.author = author;
-        this.map = map;
+        this.corfuTable = corfuTable;
         checkpointId = UUID.randomUUID();
         checkpointStreamID = CorfuRuntime.getCheckpointStreamIdFromId(streamId);
         sv = rt.getStreamsView();
+        maxUncompressedCpEntrySize = rt.getParameters().getMaxUncompressedCpEntrySize();
         batchSize = rt.getParameters().getCheckpointBatchSize();
     }
 
@@ -136,13 +145,17 @@ public class CheckpointWriter<T extends StreamingMap> {
      *
      * @return Token at which the snapshot for this checkpoint was taken.
      */
-    public Token appendCheckpoint() {
+    public Token appendCheckpoint(Optional<LivenessUpdater> livenessUpdater) {
         // We enforce a NO_OP entry for every checkpoint, i.e., a hole with backpointer map info,
         // to materialize the stream up to this point (no future sequencer regression) and in addition ensure
         // log unit address maps reflect the latest update to the stream preventing tail regression in the
         // event of sequencer failover (if for instance the last update to the stream was a hole).
         Token snapshot = forceNoOpEntry();
-        return appendCheckpoint(snapshot);
+        return appendCheckpoint(snapshot, livenessUpdater);
+    }
+
+    public Token appendCheckpoint() {
+        return appendCheckpoint(Optional.empty());
     }
 
     /**
@@ -153,7 +166,7 @@ public class CheckpointWriter<T extends StreamingMap> {
      *  @param snapshotTimestamp snapshot at which the checkpoint is taken.
      *  */
     @VisibleForTesting
-    public Token appendCheckpoint(Token snapshotTimestamp) {
+    public Token appendCheckpoint(Token snapshotTimestamp, Optional<LivenessUpdater> livenessUpdater) {
         long start = System.currentTimeMillis();
 
         rt.getObjectsView().TXBuild()
@@ -163,14 +176,18 @@ public class CheckpointWriter<T extends StreamingMap> {
                 .begin();
 
         log.info("appendCheckpoint: Started checkpoint for {} at snapshot {}", streamId, snapshotTimestamp);
+
         
-        try (Stream<Map.Entry> entries = this.map.entryStream()) {
+        try (Stream<? extends Map.Entry<?, ?>> entries = this.corfuTable.entryStream()) {
             // A checkpoint writer will do two accesses one to obtain the object
             // vlo version and to get a shallow copy of the entry set
             // The vloVersion which will determine the checkpoint START_LOG_ADDRESS (last observed update for this
             // stream by the time of checkpointing) is defined by the stream's tail instead of the stream's version,
             // as the latter discards holes for resolution, hence if last address is a hole it would diverge
             // from the stream address space maintained by the sequencer.
+
+            livenessUpdater.ifPresent(LivenessUpdater::notifyOnSyncComplete);
+
             startCheckpoint(snapshotTimestamp);
             int entryCount = appendObjectState(entries);
             finishCheckpoint();
@@ -207,7 +224,7 @@ public class CheckpointWriter<T extends StreamingMap> {
         return tags;
     }
 
-    private Token forceNoOpEntry() {
+    public Token forceNoOpEntry() {
         Set<UUID> streamsToAdvance = new HashSet<>();
         if (serializer instanceof DynamicProtobufSerializer) {
             // One of the use-cases of a no-op entry written by the checkpointer is to always - even for empty streams -
@@ -258,7 +275,7 @@ public class CheckpointWriter<T extends StreamingMap> {
      *  Append an object to a stream without caching the entries.
      */
     private long nonCachedAppend(Object object, UUID ... streamIDs) {
-        return sv.append(object, null, CacheOption.WRITE_AROUND, streamIDs);
+        return sv.append(object, null, CacheOption.WRITE_AROUND, true, streamIDs);
     }
 
     /**
@@ -304,20 +321,20 @@ public class CheckpointWriter<T extends StreamingMap> {
      *
      * @return Stream of global log addresses of the CONTINUATION records written.
      */
-    public int appendObjectState(Stream<Map.Entry> entryStream) {
+    public int appendObjectState(Stream<? extends Map.Entry<?, ?>> entryStream) {
         int maxWriteSizeLimit = (int) (batchThresholdPercentage * getMaxWriteSize());
         ImmutableMap<CheckpointEntry.CheckpointDictKey,String> kvCopy =
                 ImmutableMap.copyOf(this.mdkv);
 
         int totalEntryCount = 0;
         int numBytesPerCheckpointEntry = 0;
+        int numBytesPerUncompressedCheckpointEntry = 0;
 
-        ByteBuf inputBuffer = Unpooled.buffer();
         MultiSMREntry smrEntries = new MultiSMREntry();
 
-        Iterator<Map.Entry> iterator = entryStream.iterator();
+        Iterator<? extends Map.Entry<?, ?>> iterator = entryStream.iterator();
         while (iterator.hasNext()) {
-            Map.Entry entry = iterator.next();
+            Map.Entry<?, ?> entry = iterator.next();
             SMREntry smrPutEntry = new SMREntry("put",
                     new Object[]{keyMutator.apply(entry.getKey()),
                             valueMutator.apply(entry.getValue())},
@@ -326,32 +343,31 @@ public class CheckpointWriter<T extends StreamingMap> {
             /* Need to check the size of the compressed buffer. inputByteBuffer and
                inputBuffer are the same buffer.
              */
+            ByteBuf inputBuffer = Unpooled.buffer();
             smrPutEntry.serialize(inputBuffer);
-            ByteBuffer compressedBuffer =
-                    rt.getParameters()
-                            .getCodecType()
-                            .getInstance().compress(ByteBuffer.wrap(inputBuffer.array(),
-                            inputBuffer.readerIndex(), inputBuffer.writerIndex()));
-
-            numBytesPerCheckpointEntry += compressedBuffer.limit();
+            numBytesPerUncompressedCheckpointEntry += smrPutEntry.getSerializedSize();
+            int compressedBufferSize = getCompressedBufferSize(inputBuffer);
+            numBytesPerCheckpointEntry += compressedBufferSize;
+            inputBuffer.clear();
 
             /* CheckpointEntry has some metadata and make the total size larger than the actual size
              * of SMR entries. Its a safeguard against the smr entries amounting to the actual
              * boundary limit.
              */
-            if (numBytesPerCheckpointEntry > maxWriteSizeLimit || smrEntries.getUpdates().size() >= batchSize) {
+            if (numBytesPerUncompressedCheckpointEntry > maxUncompressedCpEntrySize
+                    || numBytesPerCheckpointEntry > maxWriteSizeLimit || smrEntries.getUpdates().size() >= batchSize) {
                 convertAndAppendCheckpointEntry(smrEntries, kvCopy);
                 log.trace("Batched size of checkpoint log entry consists {} smr entries",
                         smrEntries.getUpdates().size());
                 /* reset the num of bytes and the new batch size entries below
                 also, reset the smr entry to add the newly read SMR:each from the stream. */
-                numBytesPerCheckpointEntry = compressedBuffer.limit();
+                numBytesPerCheckpointEntry = compressedBufferSize;
+                numBytesPerUncompressedCheckpointEntry = smrPutEntry.getSerializedSize();
                 smrEntries = new MultiSMREntry();
             }
             smrEntries.addTo(smrPutEntry);
             // maintain current batch size only for test purposes.
             totalEntryCount++;
-            inputBuffer.clear();
         }
 
         // the entries which are left behind for a final flush.
@@ -361,6 +377,15 @@ public class CheckpointWriter<T extends StreamingMap> {
                     smrEntries.getUpdates().size());
         }
         return totalEntryCount;
+    }
+
+    private int getCompressedBufferSize(ByteBuf inputBuffer) {
+        ByteBuffer compressedBuffer =
+                rt.getParameters()
+                        .getCodecType()
+                        .getInstance().compress(ByteBuffer.wrap(inputBuffer.array(),
+                                inputBuffer.readerIndex(), inputBuffer.writerIndex()));
+        return compressedBuffer.limit();
     }
 
     /** Append a checkpoint END record to this object's stream.

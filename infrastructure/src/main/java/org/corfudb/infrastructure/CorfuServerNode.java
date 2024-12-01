@@ -1,6 +1,8 @@
 package org.corfudb.infrastructure;
 
 import com.google.common.collect.ImmutableMap;
+import io.micrometer.prometheus.PrometheusConfig;
+import io.micrometer.prometheus.PrometheusMeterRegistry;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.channel.Channel;
@@ -13,26 +15,46 @@ import io.netty.handler.codec.LengthFieldBasedFrameDecoder;
 import io.netty.handler.codec.LengthFieldPrepender;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslHandler;
+import io.prometheus.client.exporter.HTTPServer;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.io.IOUtils;
+import org.corfudb.common.config.ConfigParamNames;
 import org.corfudb.common.metrics.micrometer.MeterRegistryProvider;
+import org.corfudb.common.metrics.micrometer.MeterRegistryProvider.MeterRegistryInitializer;
+import org.corfudb.infrastructure.ManagementServer.ManagementServerInitializer;
+import org.corfudb.infrastructure.health.HealthMonitor;
+import org.corfudb.infrastructure.health.HttpServerInitializer;
 import org.corfudb.protocols.wireprotocol.NettyCorfuMessageDecoder;
 import org.corfudb.protocols.wireprotocol.NettyCorfuMessageEncoder;
 import org.corfudb.runtime.exceptions.unrecoverable.UnrecoverableCorfuInterruptedError;
+import org.corfudb.runtime.view.Layout;
 import org.corfudb.security.sasl.plaintext.PlainTextSaslNettyServer;
 import org.corfudb.security.tls.SslContextConstructor;
+import org.corfudb.security.tls.TlsUtils.CertStoreConfig.KeyStoreConfig;
+import org.corfudb.security.tls.TlsUtils.CertStoreConfig.TrustStoreConfig;
+import org.corfudb.util.FileWatcher;
 import org.corfudb.util.GitRepositoryState;
 
 import javax.annotation.Nonnull;
 import javax.net.ssl.SSLEngine;
 import javax.net.ssl.SSLException;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Pattern;
+
+import static org.corfudb.common.util.URLUtils.getVersionFormattedHostAddress;
+import static org.corfudb.infrastructure.CorfuServerCmdLine.HEALTH_PORT_PARAM;
+import static org.corfudb.infrastructure.CorfuServerCmdLine.METRICS_PORT_PARAM;
 
 
 /**
@@ -45,7 +67,7 @@ public class CorfuServerNode implements AutoCloseable {
     private final ServerContext serverContext;
 
     @Getter
-    private final Map<Class, AbstractServer> serverMap;
+    private final Map<Class<?>, AbstractServer> serverMap;
 
     @Getter
     private final NettyServerRouter router;
@@ -53,7 +75,14 @@ public class CorfuServerNode implements AutoCloseable {
     // This flag makes the closing of the CorfuServer idempotent.
     private final AtomicBoolean close;
 
-    private ChannelFuture bindFuture;
+    private volatile ChannelFuture bindFuture;
+
+    private volatile ChannelFuture httpServerFuture;
+
+    private HTTPServer metricsServer;
+
+    @Getter
+    private final Optional<FileWatcher> sslCertWatcher;
 
     /**
      * Corfu Server initialization.
@@ -61,15 +90,13 @@ public class CorfuServerNode implements AutoCloseable {
      * @param serverContext Initialized Server Context.
      */
     public CorfuServerNode(@Nonnull ServerContext serverContext) {
-        this(serverContext,
-                ImmutableMap.<Class, AbstractServer>builder()
-                        .put(BaseServer.class, new BaseServer(serverContext))
-                        .put(SequencerServer.class, new SequencerServer(serverContext))
-                        .put(LayoutServer.class, new LayoutServer(serverContext))
-                        .put(LogUnitServer.class, new LogUnitServer(serverContext))
-                        .put(ManagementServer.class, new ManagementServer(serverContext,
-                                new ManagementServer.ManagementServerInitializer()))
-                        .build()
+        this(serverContext, ImmutableMap.<Class<?>, AbstractServer>builder()
+                .put(BaseServer.class, new BaseServer(serverContext))
+                .put(SequencerServer.class, new SequencerServer(serverContext))
+                .put(LayoutServer.class, new LayoutServer(serverContext))
+                .put(LogUnitServer.class, new LogUnitServer(serverContext))
+                .put(ManagementServer.class, new ManagementServer(serverContext, new ManagementServerInitializer()))
+                .build()
         );
     }
 
@@ -80,30 +107,91 @@ public class CorfuServerNode implements AutoCloseable {
      * @param serverMap     Server Map with all components.
      */
     public CorfuServerNode(@Nonnull ServerContext serverContext,
-                           @Nonnull ImmutableMap<Class, AbstractServer> serverMap) {
+                           @Nonnull ImmutableMap<Class<?>, AbstractServer> serverMap) {
         this.serverContext = serverContext;
         this.serverMap = serverMap;
-        router = new NettyServerRouter(serverMap.values().asList(), serverContext);
+        this.router = new NettyServerRouter(serverMap.values().asList(), serverContext);
         this.serverContext.setServerRouter(router);
+
         // If the node is started in the single node setup and was bootstrapped,
         // set the server epoch as well.
-        if(serverContext.isSingleNodeSetup() && serverContext.getCurrentLayout() != null){
-            serverContext.setServerEpoch(serverContext.getCurrentLayout().getEpoch(),
-                    router);
-        }
+        Optional<Layout> maybeCurrentLayout = serverContext.findCurrentLayout();
+
+        maybeCurrentLayout.ifPresent(currentLayout -> {
+            if (serverContext.isSingleNodeSetup()) {
+                serverContext.setServerEpoch(currentLayout.getEpoch(), router);
+            }
+        });
+
         this.close = new AtomicBoolean(false);
+        // Initialize the getSslCertWatcher
+        if (serverContext
+                .<Boolean>getServerConfig(ConfigParamNames.DISABLE_FILE_WATCHER)
+                .orElse(KeyStoreConfig.DEFAULT_DISABLE_FILE_WATCHER)){
+            log.info("CorfuServerNode: Disabling FileWatcher for corfu server as per the server args.");
+            sslCertWatcher = Optional.empty();
+        } else {
+            log.info("CorfuServerNode: Starting FileWatcher for corfu server as per the server args.");
+            sslCertWatcher = FileWatcher.newInstance(
+                    serverContext.getServerConfig(String.class, ConfigParamNames.KEY_STORE),
+                    this::restartServerChannel);
+        }
+
     }
 
     /**
      * Start the Corfu Server by listening on the specified port.
      */
     public ChannelFuture start() {
-        bindFuture = bindServer(serverContext.getWorkerGroup(),
+        final int corfuPort = Integer.parseInt((String) serverContext.getServerConfig().get("<port>"));
+        bindFuture = bindServer(
+                serverContext.getWorkerGroup(),
                 this::configureBootstrapOptions,
                 serverContext,
                 router,
                 (String) serverContext.getServerConfig().get("--address"),
-                Integer.parseInt((String) serverContext.getServerConfig().get("<port>")));
+                corfuPort
+        );
+
+        Optional<Integer> maybeHealthPort = Optional
+                .ofNullable(serverContext.getServerConfig().get(HEALTH_PORT_PARAM))
+                .map(healthApiPort -> Integer.parseInt(healthApiPort.toString()));
+
+        maybeHealthPort.ifPresent(healthApiPort -> {
+            if (healthApiPort == corfuPort) {
+                log.warn("Port unification is not currently supported. Health server will not be started.");
+            } else {
+                httpServerFuture = bindHttpServer(
+                        serverContext.getWorkerGroup(),
+                        this::configureBootstrapOptions,
+                        serverContext,
+                        healthApiPort
+                );
+            }
+        });
+
+        Optional<Integer> maybeMetricsPort = Optional
+                .ofNullable(serverContext.getServerConfig().get(METRICS_PORT_PARAM))
+                .map(metricsApiPort -> Integer.parseInt(metricsApiPort.toString()));
+
+        maybeMetricsPort.ifPresent(metricsApiPort -> {
+            if (metricsApiPort == corfuPort) {
+                log.warn("Port unification is not currently supported. Metrics server will not be started.");
+            } else {
+                PrometheusMeterRegistry prometheusRegistry = new PrometheusMeterRegistry(PrometheusConfig.DEFAULT);
+                MeterRegistryInitializer.getMeterRegistry().add(prometheusRegistry);
+
+                try {
+                    metricsServer = new HTTPServer.Builder()
+                            .withPort(metricsApiPort)
+                            .withRegistry(prometheusRegistry.getPrometheusRegistry())
+                            .build();
+                    log.info("Metrics server run on: " + metricsServer.getPort() + " port");
+                } catch (IOException e) {
+                    throw new IllegalStateException(e);
+                }
+            }
+        });
 
         return bindFuture.syncUninterruptibly();
     }
@@ -114,6 +202,45 @@ public class CorfuServerNode implements AutoCloseable {
     public void startAndListen() {
         // Wait on it to close.
         this.start().channel().closeFuture().syncUninterruptibly();
+    }
+
+    public void restartServerChannel() {
+        log.info("restartServerChannel: Stopping Corfu Server channels.");
+
+        if (bindFuture != null) {
+            bindFuture.channel().close().syncUninterruptibly();
+        }
+
+        if (httpServerFuture != null) {
+            httpServerFuture.channel().close().syncUninterruptibly();
+        }
+
+        // Check if channels are active and
+        // close them with await for thread safety
+        if (bindFuture != null
+                && bindFuture.channel() != null
+                && bindFuture.channel().isActive()) {
+                bindFuture.channel().close().awaitUninterruptibly(
+                        serverContext.getManagementRuntimeParameters().getNettyShutdownTimeout(),
+                        TimeUnit.MILLISECONDS
+                );
+        }
+
+        if (httpServerFuture != null
+                && httpServerFuture.channel() != null
+                && httpServerFuture.channel().isActive()) {
+                httpServerFuture.channel().close().awaitUninterruptibly(
+                        serverContext.getManagementRuntimeParameters().getNettyShutdownTimeout(),
+                        TimeUnit.MILLISECONDS
+                );
+        }
+
+        serverContext.refreshWorkerGroupThreads();
+
+        log.info("restartServerChannel: Reinitializing Corfu Server channels.");
+        // Invoke restartServerChannel method in CorfuServer to signal
+        // the Corfu Server's while loop to continue using latch countdown()
+        CorfuServer.restartServerChannel();
     }
 
     /**
@@ -128,10 +255,18 @@ public class CorfuServerNode implements AutoCloseable {
         }
 
         log.info("close: Shutting down Corfu server and cleaning resources");
-        serverContext.close();
+
         if (bindFuture != null) {
             bindFuture.channel().close().syncUninterruptibly();
         }
+        if (httpServerFuture != null) {
+            httpServerFuture.channel().close().syncUninterruptibly();
+        }
+
+        // close ssl cert watcher
+        sslCertWatcher.ifPresent(FileWatcher::close);
+
+        serverContext.close();
 
         // A executor service to create the shutdown threads
         // plus name the threads correctly.
@@ -162,6 +297,8 @@ public class CorfuServerNode implements AutoCloseable {
                 MeterRegistryProvider.close();
             }
         });
+        HealthMonitor.shutdown();
+        IOUtils.closeQuietly(metricsServer, ex -> {});
         log.info("close: Server shutdown and resources released");
     }
 
@@ -207,8 +344,8 @@ public class CorfuServerNode implements AutoCloseable {
             bootstrap.group(workerGroup)
                     .channel(context.getChannelImplementation().getServerChannelClass());
             bootstrapConfigurer.configure(bootstrap);
-
             bootstrap.childHandler(getServerChannelInitializer(context, router));
+
             boolean bindToAllInterfaces =
                     Optional.ofNullable(context.getServerConfig(Boolean.class, "--bind-to-all-interfaces"))
                             .orElse(false);
@@ -216,12 +353,41 @@ public class CorfuServerNode implements AutoCloseable {
                 log.info("Corfu Server listening on all interfaces on port:{}", port);
                 return bootstrap.bind(port).sync();
             } else {
-                log.info("Corfu Server listening on {}:{}", address, port);
-                return bootstrap.bind(address, port).sync();
+                log.info("Corfu Server listening on {}:{}",
+                        getVersionFormattedHostAddress(address), port);
+                return bootstrap.bind(getVersionFormattedHostAddress(address), port).sync();
             }
         } catch (InterruptedException ie) {
             throw new UnrecoverableCorfuInterruptedError(ie);
         }
+    }
+
+    public ChannelFuture bindHttpServer(@Nonnull EventLoopGroup workerGroup,
+                                        @Nonnull BootstrapConfigurer bootstrapConfigurer,
+                                        @Nonnull ServerContext context, int port) {
+        try {
+            ServerBootstrap bootstrap = new ServerBootstrap();
+            bootstrap.group(workerGroup)
+                    .channel(context.getChannelImplementation().getServerChannelClass());
+            bootstrapConfigurer.configure(bootstrap);
+            bootstrap.childHandler(new HttpServerInitializer());
+            boolean bindToAllInterfaces =
+                    Optional.ofNullable(context.getServerConfig(Boolean.class, "--bind-to-all-interfaces"))
+                            .orElse(false);
+            String address = (String) serverContext.getServerConfig().get("--address");
+
+            if (bindToAllInterfaces) {
+                log.info("Corfu Http Server listening on all interfaces on port:{}", port);
+                return bootstrap.bind(port).sync();
+            } else {
+                log.info("Corfu Http Server listening on {}:{}",
+                        getVersionFormattedHostAddress(address), port);
+                return bootstrap.bind(getVersionFormattedHostAddress(address), port).sync();
+            }
+        } catch (InterruptedException ie) {
+            throw new UnrecoverableCorfuInterruptedError(ie);
+        }
+
     }
 
     /**
@@ -246,95 +412,123 @@ public class CorfuServerNode implements AutoCloseable {
      * @param router  The {@link NettyServerRouter} to initialize the channel with.
      * @return A {@link ChannelInitializer} to initialize the channel.
      */
-    private static ChannelInitializer getServerChannelInitializer(@Nonnull ServerContext context,
-                                                                  @Nonnull NettyServerRouter router) {
+    private static ChannelInitializer<Channel> getServerChannelInitializer(
+            @Nonnull ServerContext context, @Nonnull NettyServerRouter router) {
 
-        // Generate the initializer.
-        return new ChannelInitializer() {
-            @Override
-            protected void initChannel(@Nonnull Channel ch) throws Exception {
+        return new CorfuChannelInitializer(context, router);
+    }
 
-                // Security variables
-                final SslContext sslContext;
-                final String[] enabledTlsProtocols;
-                final String[] enabledTlsCipherSuites;
+    private static class CorfuChannelInitializer extends ChannelInitializer<Channel> {
+        private final ServerContext context;
+        private final NettyServerRouter router;
 
-                // Security Initialization
-                Boolean tlsEnabled = context.getServerConfig(Boolean.class, "--enable-tls");
-                Boolean tlsMutualAuthEnabled = context.getServerConfig(Boolean.class,
-                        "--enable-tls-mutual-auth");
-                if (tlsEnabled) {
-                    // Get the TLS cipher suites to enable
-                    String ciphs = context.getServerConfig(String.class, "--tls-ciphers");
-                    if (ciphs != null) {
-                        enabledTlsCipherSuites = Pattern.compile(",")
-                                .splitAsStream(ciphs)
-                                .map(String::trim)
-                                .toArray(String[]::new);
-                    } else {
-                        enabledTlsCipherSuites = new String[]{};
-                    }
+        public CorfuChannelInitializer(ServerContext context, NettyServerRouter router) {
+            this.context = context;
+            this.router = router;
+        }
 
-                    // Get the TLS protocols to enable
-                    String protos = context.getServerConfig(String.class, "--tls-protocols");
-                    if (protos != null) {
-                        enabledTlsProtocols = Pattern.compile(",")
-                                .splitAsStream(protos)
-                                .map(String::trim)
-                                .toArray(String[]::new);
-                    } else {
-                        enabledTlsProtocols = new String[]{};
-                    }
+        @Override
+        protected void initChannel(@Nonnull Channel ch) throws Exception {
 
-                    try {
-                        sslContext = SslContextConstructor.constructSslContext(true,
-                                context.getServerConfig(String.class, "--keystore"),
-                                context.getServerConfig(String.class, "--keystore-password-file"),
-                                context.getServerConfig(String.class, "--truststore"),
-                                context.getServerConfig(String.class,
-                                        "--truststore-password-file"));
-                    } catch (SSLException e) {
-                        log.error("Could not build the SSL context", e);
-                        throw new RuntimeException("Couldn't build the SSL context", e);
-                    }
+            // Security variables
+            final SslContext sslContext;
+            final String[] enabledTlsProtocols;
+            final String[] enabledTlsCipherSuites;
+
+            // Security Initialization
+            boolean tlsEnabled = context.getServerConfig(Boolean.class, "--enable-tls");
+            boolean tlsMutualAuthEnabled = context.getServerConfig(Boolean.class, "--enable-tls-mutual-auth");
+
+            if (tlsEnabled) {
+                // Get the TLS cipher suites to enable
+                String ciphs = context.getServerConfig(String.class, "--tls-ciphers");
+                if (ciphs != null) {
+                    enabledTlsCipherSuites = Pattern.compile(",")
+                            .splitAsStream(ciphs)
+                            .map(String::trim)
+                            .toArray(String[]::new);
                 } else {
                     enabledTlsCipherSuites = new String[]{};
+                }
+
+                // Get the TLS protocols to enable
+                String protos = context.getServerConfig(String.class, "--tls-protocols");
+                if (protos != null) {
+                    enabledTlsProtocols = Pattern.compile(",")
+                            .splitAsStream(protos)
+                            .map(String::trim)
+                            .toArray(String[]::new);
+                } else {
                     enabledTlsProtocols = new String[]{};
-                    sslContext = null;
                 }
 
-                Boolean saslPlainTextAuth = context.getServerConfig(Boolean.class,
-                        "--enable-sasl-plain-text-auth");
+                try {
+                    KeyStoreConfig keyStoreConfig = KeyStoreConfig.from(
+                            context.getServerConfig(String.class, ConfigParamNames.KEY_STORE),
+                            context.getServerConfig(String.class, ConfigParamNames.KEY_STORE_PASS_FILE)
+                    );
 
-                // If TLS is enabled, setup the encryption pipeline.
-                if (tlsEnabled) {
-                    SSLEngine engine = sslContext.newEngine(ch.alloc());
-                    engine.setEnabledCipherSuites(enabledTlsCipherSuites);
-                    engine.setEnabledProtocols(enabledTlsProtocols);
-                    if (tlsMutualAuthEnabled) {
-                        engine.setNeedClientAuth(true);
-                    }
-                    ch.pipeline().addLast("ssl", new SslHandler(engine));
+                    Path certExpiryFile = context
+                            .<String>getServerConfig(ConfigParamNames.DISABLE_CERT_EXPIRY_CHECK_FILE)
+                            .map(Paths::get)
+                            .orElse(TrustStoreConfig.DEFAULT_DISABLE_CERT_EXPIRY_CHECK_FILE);
+
+                    log.trace("initChannel: certExpiryFile path is {}, isCertExpiryCheckEnabled is {}.",
+                            certExpiryFile, !Files.exists(certExpiryFile));
+
+                    TrustStoreConfig trustStoreConfig = TrustStoreConfig.from(
+                            context.getServerConfig(String.class, ConfigParamNames.TRUST_STORE),
+                            context.getServerConfig(String.class, ConfigParamNames.TRUST_STORE_PASS_FILE),
+                            certExpiryFile
+                    );
+
+                    log.info("initChannel: constructSslContext from CorfuServerNode");
+                    sslContext = SslContextConstructor.constructSslContext(
+                            true, keyStoreConfig, trustStoreConfig
+                    );
+                } catch (SSLException e) {
+                    log.error("Could not build the SSL context", e);
+                    throw new RuntimeException("Couldn't build the SSL context", e);
                 }
-                // Add/parse a length field
-                ch.pipeline().addLast(new LengthFieldPrepender(4));
-                ch.pipeline().addLast(new LengthFieldBasedFrameDecoder(Integer
-                        .MAX_VALUE, 0, 4,
-                        0, 4));
-                // If SASL authentication is requested, perform a SASL plain-text auth.
-                if (saslPlainTextAuth) {
-                    ch.pipeline().addLast("sasl/plain-text", new
-                            PlainTextSaslNettyServer());
-                }
-                // Transform the framed message into a Corfu message.
-                ch.pipeline().addLast(new NettyCorfuMessageDecoder());
-                ch.pipeline().addLast(new NettyCorfuMessageEncoder());
-                ch.pipeline().addLast(new ServerHandshakeHandler(context.getNodeId(),
-                        GitRepositoryState.getCorfuSourceCodeVersion(),
-                        context.getServerConfig(String.class, "--HandshakeTimeout")));
-                // Route the message to the server class.
-                ch.pipeline().addLast(router);
+            } else {
+                enabledTlsCipherSuites = new String[]{};
+                enabledTlsProtocols = new String[]{};
+                sslContext = null;
             }
-        };
+
+            Boolean saslPlainTextAuth = context.getServerConfig(Boolean.class,
+                    "--enable-sasl-plain-text-auth");
+
+            // If TLS is enabled, setup the encryption pipeline.
+            if (tlsEnabled) {
+                SSLEngine engine = sslContext.newEngine(ch.alloc());
+                engine.setEnabledCipherSuites(enabledTlsCipherSuites);
+                engine.setEnabledProtocols(enabledTlsProtocols);
+                if (tlsMutualAuthEnabled) {
+                    engine.setNeedClientAuth(true);
+                }
+                ch.pipeline().addLast("ssl", new SslHandler(engine));
+            }
+            // Add/parse a length field
+            ch.pipeline().addLast(new LengthFieldPrepender(4));
+            ch.pipeline().addLast(new LengthFieldBasedFrameDecoder(Integer.MAX_VALUE, 0, 4, 0, 4));
+            // If SASL authentication is requested, perform a SASL plain-text auth.
+            if (saslPlainTextAuth) {
+                ch.pipeline().addLast("sasl/plain-text", new PlainTextSaslNettyServer());
+            }
+            // Transform the framed message into a Corfu message.
+            ch.pipeline().addLast(new NettyCorfuMessageDecoder());
+            ch.pipeline().addLast(new NettyCorfuMessageEncoder());
+
+            ServerHandshakeHandler serverHandshakeHandler = new ServerHandshakeHandler(
+                    context.getNodeId(),
+                    GitRepositoryState.getCorfuSourceCodeVersion(),
+                    context.getServerConfig(String.class, "--HandshakeTimeout")
+            );
+            ch.pipeline().addLast(serverHandshakeHandler);
+
+            // Route the message to the server class.
+            ch.pipeline().addLast(router);
+        }
     }
 }

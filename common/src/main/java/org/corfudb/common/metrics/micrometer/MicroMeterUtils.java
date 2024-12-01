@@ -8,6 +8,7 @@ import io.micrometer.core.instrument.Meter;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Tags;
 import io.micrometer.core.instrument.Timer;
+import lombok.extern.slf4j.Slf4j;
 import org.corfudb.common.metrics.micrometer.MeterRegistryProvider.MetricType;
 import org.corfudb.common.util.Tuple;
 
@@ -17,13 +18,15 @@ import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 import java.util.function.ToDoubleFunction;
 import java.util.stream.Collectors;
 
+@Slf4j
 public class MicroMeterUtils {
 
-    private static final double[] PERCENTILES = new double[]{0.5, 0.99};
+    private static final double[] PERCENTILES = new double[]{0.5, 0.75, 0.99};
     private static final boolean PUBLISH_HISTOGRAM = true;
     /**
      * A list of server metrics that will be ignored.
@@ -34,7 +37,6 @@ public class MicroMeterUtils {
             "corfu.infrastructure.message-handler.committed_tail_request",
             "corfu.infrastructure.message-handler.inspect_addresses_request",
             "corfu.infrastructure.message-handler.query_node_request",
-            "corfu.infrastructure.message-handler.write_log_request",
             "corfu.infrastructure.message-handler.read_log_request",
             "corfu.infrastructure.message-handler.sequencer_metrics_request",
             "corfu.infrastructure.message-handler.trim_mark_request",
@@ -130,6 +132,19 @@ public class MicroMeterUtils {
         return MeterRegistryProvider.getInstance().map(Timer::start);
     }
 
+    /**
+     * Start sampling conditionally, based on the given rate
+     *
+     * @param shouldSample start timer if this value is true
+     * @return a sample to be used with the timer
+     */
+    public static Optional<Timer.Sample> startTimer(boolean shouldSample) {
+        if (shouldSample) {
+            return MeterRegistryProvider.getInstance().map(Timer::start);
+        }
+        return Optional.empty();
+    }
+
     public static void measure(double measuredValue, String name, String... tags) {
         Optional<DistributionSummary> summary = createOrGetDistSummary(name, tags);
         summary.ifPresent(s -> s.record(measuredValue));
@@ -189,6 +204,20 @@ public class MicroMeterUtils {
 
     public static void counterIncrement(double value, String name, String... tags) {
         filterGetInstance(name).ifPresent(registry -> registry.counter(name, tags).increment(value));
+    }
+
+    public static <T> CompletableFuture<T> timeWhenCompletes(CompletableFuture<T> future, String msg) {
+        AtomicLong atomicLong  = new AtomicLong(System.currentTimeMillis());
+        CompletableFuture<T> cf = new CompletableFuture<>();
+        future.whenComplete((res, ex) -> {
+            log.info(msg + " took: {}", (System.currentTimeMillis() - atomicLong.get()));
+            if (ex != null) {
+                cf.completeExceptionally(ex);
+            } else {
+                cf.complete(res);
+            }
+        });
+        return cf;
     }
 
     public static <T> CompletableFuture<T> timeWhenCompletes(CompletableFuture<T> future,

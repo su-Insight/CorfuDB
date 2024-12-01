@@ -5,20 +5,11 @@ import com.google.common.util.concurrent.MoreExecutors;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelHandlerContext;
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.UUID;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.stream.Collectors;
-import java.util.stream.LongStream;
 import lombok.extern.slf4j.Slf4j;
+import org.corfudb.infrastructure.BatchProcessor.BatchProcessorContext;
+import org.corfudb.infrastructure.LogUnitServer.LogUnitServerConfig;
 import org.corfudb.infrastructure.log.StreamLog;
 import org.corfudb.infrastructure.log.StreamLogCompaction;
-import org.corfudb.infrastructure.LogUnitServer.LogUnitServerConfig;
 import org.corfudb.protocols.service.CorfuProtocolMessage.ClusterIdCheck;
 import org.corfudb.protocols.service.CorfuProtocolMessage.EpochCheck;
 import org.corfudb.protocols.wireprotocol.DataType;
@@ -43,6 +34,17 @@ import org.junit.Test;
 import org.mockito.ArgumentCaptor;
 import org.mockito.junit.MockitoJUnit;
 import org.mockito.junit.MockitoRule;
+
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
+import java.util.stream.LongStream;
 
 import static org.corfudb.protocols.CorfuProtocolCommon.DEFAULT_UUID;
 import static org.corfudb.protocols.CorfuProtocolCommon.getStreamsAddressResponse;
@@ -165,16 +167,24 @@ public class LogUnitServerTest {
                 .thenReturn(ImmutableMap.of(
                         "--cache-heap-ratio", "0.5",
                         "--memory", false,
-                        "--no-verify", false,
                         "--no-sync", false));
 
         // Prepare the LogUnitServerInitializer.
         LogUnitServer.LogUnitServerInitializer mLUSI = mock(LogUnitServer.LogUnitServerInitializer.class);
-        when(mLUSI.buildStreamLog(any(LogUnitServerConfig.class), eq(mServerContext))).thenReturn(mStreamLog);
+        when(mLUSI.buildStreamLog(
+                any(LogUnitServerConfig.class),
+                eq(mServerContext),
+                any(BatchProcessorContext.class)
+        )).thenReturn(mStreamLog);
+
         when(mLUSI.buildLogUnitServerCache(any(LogUnitServerConfig.class), eq(mStreamLog))).thenReturn(mCache);
         when(mLUSI.buildStreamLogCompaction(mStreamLog)).thenReturn(mock(StreamLogCompaction.class));
-        when(mLUSI.buildBatchProcessor(any(LogUnitServerConfig.class),
-                eq(mStreamLog), eq(mServerContext))).thenReturn(mBatchProcessor);
+        when(mLUSI.buildBatchProcessor(
+                any(LogUnitServerConfig.class),
+                eq(mStreamLog),
+                eq(mServerContext),
+                any(BatchProcessorContext.class)
+        )).thenReturn(mBatchProcessor);
 
         logUnitServer = new LogUnitServer(mServerContext, mLUSI);
     }

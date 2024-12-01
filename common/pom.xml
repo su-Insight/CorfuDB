@@ -24,7 +24,13 @@
         <dependency>
             <groupId>org.ehcache</groupId>
             <artifactId>sizeof</artifactId>
-            <version>0.3.0</version>
+            <version>0.4.4</version>
+            <exclusions>
+                <exclusion>
+                    <groupId>org.slf4j</groupId>
+                    <artifactId>slf4j-api</artifactId>
+                </exclusion>
+            </exclusions>
         </dependency>
         <dependency>
             <groupId>io.micrometer</groupId>
@@ -34,7 +40,7 @@
         <dependency>
             <groupId>io.micrometer</groupId>
             <artifactId>micrometer-registry-prometheus</artifactId>
-            <version>1.5.5</version>
+            <version>1.10.5</version>
         </dependency>
         <dependency>
             <groupId>net.jpountz.lz4</groupId>
@@ -50,11 +56,6 @@
             <groupId>io.dropwizard.metrics</groupId>
             <artifactId>metrics-core</artifactId>
             <version>4.2.1</version>
-        </dependency>
-        <dependency>
-            <groupId>com.google.protobuf</groupId>
-            <artifactId>protobuf-java</artifactId>
-            <version>3.6.1</version>
         </dependency>
         <dependency>
             <groupId>ch.qos.logback</groupId>

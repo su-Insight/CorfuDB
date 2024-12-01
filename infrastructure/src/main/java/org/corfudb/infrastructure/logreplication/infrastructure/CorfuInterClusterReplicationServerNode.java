@@ -1,14 +1,11 @@
 package org.corfudb.infrastructure.logreplication.infrastructure;
 
-import com.google.common.collect.ImmutableMap;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 import org.corfudb.infrastructure.AbstractServer;
-import org.corfudb.infrastructure.BaseServer;
 import org.corfudb.infrastructure.LogReplicationServer;
 import org.corfudb.infrastructure.ServerContext;
 import org.corfudb.infrastructure.ServerThreadFactory;
-import org.corfudb.infrastructure.logreplication.LogReplicationConfig;
 import org.corfudb.infrastructure.logreplication.runtime.LogReplicationServerRouter;
 import org.corfudb.runtime.exceptions.unrecoverable.UnrecoverableCorfuError;
 
@@ -32,30 +29,8 @@ public class CorfuInterClusterReplicationServerNode implements AutoCloseable {
     @Getter
     private final LogReplicationServerRouter router;
 
-    @Getter
-    private LogReplicationConfig logReplicationConfig;
-
     // This flag makes the closing of the CorfuServer idempotent.
     private final AtomicBoolean close;
-
-    /**
-     * Corfu Server initialization.
-     *
-     * @param serverContext Initialized Server Context.
-     * @param server log replication server handler
-     * @param
-     */
-    public CorfuInterClusterReplicationServerNode(@Nonnull ServerContext serverContext,
-                                                  @Nonnull LogReplicationServer server,
-                                                  @Nonnull LogReplicationConfig config) {
-        this(serverContext,
-                ImmutableMap.<Class, AbstractServer>builder()
-                        .put(BaseServer.class, new BaseServer(serverContext))
-                        .put(LogReplicationServer.class, server)
-                        .build()
-        );
-        this.logReplicationConfig = config;
-    }
 
     /**
      * Corfu Server initialization.

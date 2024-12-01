@@ -3,7 +3,12 @@ package org.corfudb.infrastructure;
 import com.google.common.collect.ImmutableMap;
 import lombok.Data;
 import lombok.experimental.Accessors;
+import org.corfudb.common.config.ConfigParamNames;
+import org.corfudb.security.tls.TlsUtils.CertStoreConfig.TrustStoreConfig;
 import org.corfudb.test.concurrent.TestThreadGroups;
+
+import static org.corfudb.common.config.ConfigParamNames.DISABLE_FILE_WATCHER;
+import static org.corfudb.security.tls.TlsUtils.CertStoreConfig.KeyStoreConfig.DEFAULT_DISABLE_FILE_WATCHER;
 
 /**
  * Created by mwei on 6/29/16.
@@ -16,7 +21,6 @@ public class ServerContextBuilder {
     boolean single = true;
     boolean memory = true;
     String logPath = null;
-    boolean noVerify = false;
     boolean noSync = false;
     boolean noAutoCommit = true;
 
@@ -29,6 +33,8 @@ public class ServerContextBuilder {
     boolean saslPlainTextAuth = false;
     String truststore = "";
     String truststorePasswordFile = "";
+    String disableCertExpiryCheckFile = TrustStoreConfig.DEFAULT_DISABLE_CERT_EXPIRY_CHECK_FILE.toString();
+    boolean disableFileWatcher = DEFAULT_DISABLE_FILE_WATCHER;
 
     String implementation = "local";
 
@@ -37,6 +43,7 @@ public class ServerContextBuilder {
     int port = 9000;
     String seqCache = "1000";
     String logSizeLimitPercentage = "100.0";
+    String reservedSpaceBytes = "0";
     String batchSize = "100";
     String managementBootstrapEndpoint = null;
     IServerRouter serverRouter;
@@ -61,6 +68,7 @@ public class ServerContextBuilder {
                 .put("--HandshakeTimeout", handshakeTimeout)
                 .put("--sequencer-cache-size", seqCache)
                 .put("--log-size-quota-percentage", logSizeLimitPercentage)
+                .put("--reserved-space-bytes", reservedSpaceBytes)
                 .put("--batch-size", batchSize)
                 .put("--metadata-retention", retention);
         if (logPath != null) {
@@ -70,7 +78,6 @@ public class ServerContextBuilder {
             builder.put("--management-server", managementBootstrapEndpoint);
         }
          builder
-                 .put("--no-verify", noVerify)
                  .put("--no-sync", noSync)
                  .put("--no-auto-commit", true)
                  .put("--address", address)
@@ -79,10 +86,12 @@ public class ServerContextBuilder {
                  .put("--enable-tls-mutual-auth", tlsMutualAuthEnabled)
                  .put("--tls-protocols", tlsProtocols)
                  .put("--tls-ciphers", tlsCiphers)
-                 .put("--keystore", keystore)
-                 .put("--keystore-password-file", keystorePasswordFile)
-                 .put("--truststore", truststore)
-                 .put("--truststore-password-file", truststorePasswordFile)
+                 .put(ConfigParamNames.KEY_STORE, keystore)
+                 .put(ConfigParamNames.KEY_STORE_PASS_FILE, keystorePasswordFile)
+                 .put(ConfigParamNames.TRUST_STORE, truststore)
+                 .put(ConfigParamNames.TRUST_STORE_PASS_FILE, truststorePasswordFile)
+                 .put(ConfigParamNames.DISABLE_CERT_EXPIRY_CHECK_FILE, disableCertExpiryCheckFile)
+                 .put(DISABLE_FILE_WATCHER, disableFileWatcher)
                  .put("--enable-sasl-plain-text-auth", saslPlainTextAuth)
                  .put("--cluster-id", clusterId)
                  .put("--implementation", implementation)

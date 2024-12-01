@@ -1,19 +1,27 @@
 package org.corfudb.integration;
 
+import com.google.protobuf.Message;
 import lombok.extern.slf4j.Slf4j;
 import org.corfudb.infrastructure.logreplication.infrastructure.plugins.DefaultClusterConfig;
-import org.corfudb.infrastructure.logreplication.infrastructure.plugins.DefaultLogReplicationConfigAdapter;
+import org.corfudb.infrastructure.logreplication.infrastructure.plugins.DefaultClusterManager;
 import org.corfudb.infrastructure.logreplication.proto.LogReplicationMetadata;
+import org.corfudb.infrastructure.logreplication.proto.LogReplicationMetadata.ReplicationEvent;
+import org.corfudb.infrastructure.logreplication.proto.LogReplicationMetadata.ReplicationEventKey;
+import org.corfudb.infrastructure.logreplication.proto.LogReplicationMetadata.ReplicationStatusVal;
+import org.corfudb.infrastructure.logreplication.proto.LogReplicationMetadata.ReplicationStatusKey;
 import org.corfudb.infrastructure.logreplication.proto.Sample;
+import org.corfudb.infrastructure.logreplication.proto.Sample.IntValue;
+import org.corfudb.infrastructure.logreplication.proto.Sample.Metadata;
+import org.corfudb.infrastructure.logreplication.proto.Sample.StringKey;
 import org.corfudb.infrastructure.logreplication.replication.LogReplicationAckReader;
 import org.corfudb.infrastructure.logreplication.replication.receive.LogReplicationMetadataManager;
-import org.corfudb.infrastructure.logreplication.proto.LogReplicationMetadata.ReplicationStatusVal;
 import org.corfudb.protocols.wireprotocol.ILogData;
+import org.corfudb.runtime.CorfuOptions;
 import org.corfudb.runtime.CorfuRuntime;
 import org.corfudb.runtime.CorfuStoreMetadata;
+import org.corfudb.runtime.ExampleSchemas.ClusterUuidMsg;
 import org.corfudb.runtime.collections.CorfuStore;
 import org.corfudb.runtime.collections.CorfuStreamEntries;
-import org.corfudb.runtime.collections.CorfuStreamEntry;
 import org.corfudb.runtime.collections.StreamListener;
 import org.corfudb.runtime.collections.Table;
 import org.corfudb.runtime.collections.TableOptions;
@@ -21,9 +29,11 @@ import org.corfudb.runtime.collections.TxnContext;
 import org.corfudb.runtime.view.Address;
 import org.corfudb.runtime.view.ObjectsView;
 import org.corfudb.runtime.view.stream.IStreamView;
+import org.corfudb.test.SampleSchema.SampleTableAMsg;
 import org.corfudb.test.SampleSchema.ValueFieldTagOne;
 import org.corfudb.test.SampleSchema.ValueFieldTagOneAndTwo;
 import org.corfudb.util.Sleep;
+import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
 
@@ -31,6 +41,7 @@ import java.io.File;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -44,6 +55,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.fail;
+import static org.corfudb.infrastructure.logreplication.replication.receive.LogReplicationMetadataManager.REPLICATION_EVENT_TABLE_NAME;
+import static org.corfudb.infrastructure.logreplication.replication.receive.LogReplicationMetadataManager.REPLICATION_STATUS_TABLE;
 
 /**
  * This suite of tests validates the behavior of Log Replication
@@ -56,6 +69,8 @@ public class CorfuReplicationReconfigurationIT extends LogReplicationAbstractIT 
 
     private static final int SLEEP_DURATION = 5;
     private static final int WAIT_DELTA = 50;
+
+    private static final int MAP_COUNT = 10;
 
     private AtomicBoolean replicationEnded = new AtomicBoolean(false);
 
@@ -96,7 +111,7 @@ public class CorfuReplicationReconfigurationIT extends LogReplicationAbstractIT 
     public void testStandbyClusterReset() throws Exception {
         // (1) Snapshot and Log Entry Sync
         log.debug(">>> (1) Start Snapshot and Log Entry Sync");
-        testEndToEndSnapshotAndLogEntrySyncUFO(false);
+        testEndToEndSnapshotAndLogEntrySyncUFO(false, false);
 
         ExecutorService writerService = Executors.newSingleThreadExecutor();
 
@@ -134,7 +149,7 @@ public class CorfuReplicationReconfigurationIT extends LogReplicationAbstractIT 
 
         // (1) Snapshot and Log Entry Sync
         log.debug(">>> (1) Start Snapshot and Log Entry Sync");
-        testEndToEndSnapshotAndLogEntrySyncUFO(false);
+        testEndToEndSnapshotAndLogEntrySyncUFO(false, false);
 
         ExecutorService writerService = Executors.newSingleThreadExecutor();
 
@@ -161,7 +176,7 @@ public class CorfuReplicationReconfigurationIT extends LogReplicationAbstractIT 
 
         // (7) Verify replication status after all data has been replicated (no further data)
         corfuStoreActive.openTable(LogReplicationMetadataManager.NAMESPACE,
-                LogReplicationMetadataManager.REPLICATION_STATUS_TABLE,
+                REPLICATION_STATUS_TABLE,
                 LogReplicationMetadata.ReplicationStatusKey.class,
                 LogReplicationMetadata.ReplicationStatusVal.class,
                 null,
@@ -213,6 +228,427 @@ public class CorfuReplicationReconfigurationIT extends LogReplicationAbstractIT 
         assertThat(remainingEntriesToSend).isEqualTo(0L);
     }
 
+    /**
+     * This test verifies that if the Standby leader stops or changes when Active is in the Negotiating state, the
+     * Active cluster performs leadership verification and connects/re-connects(if no leadership change) to the leader
+     * on Standby.  Once connected, sync between the clusters is successful.
+     * @throws Exception
+     */
+    @Test
+    public void testStandbyStopInNegotiatingState() throws Exception {
+        String testStreamName = "Table001";
+        int batchSize = 5;
+
+        setupActiveAndStandbyCorfu();
+
+        // Open tables
+        Table<StringKey, IntValue, Metadata> mapActive = corfuStoreActive.openTable(
+            NAMESPACE,
+            testStreamName,
+            StringKey.class,
+            IntValue.class,
+            Metadata.class,
+            TableOptions.builder().schemaOptions(
+                    CorfuOptions.SchemaOptions.newBuilder()
+                        .setIsFederated(true)
+                        .addStreamTag(ObjectsView.LOG_REPLICATOR_STREAM_INFO.getTagName())
+                        .build())
+                .build()
+        );
+        Table<StringKey, IntValue, Metadata> mapStandby = corfuStoreStandby.openTable(
+            NAMESPACE,
+            testStreamName,
+            StringKey.class,
+            IntValue.class,
+            Metadata.class,
+            TableOptions.builder().schemaOptions(
+                    CorfuOptions.SchemaOptions.newBuilder()
+                        .setIsFederated(true)
+                        .addStreamTag(ObjectsView.LOG_REPLICATOR_STREAM_INFO.getTagName())
+                        .build())
+                .build()
+        );
+        corfuStoreStandby.openTable(LogReplicationMetadataManager.NAMESPACE,
+            REPLICATION_STATUS_TABLE,
+            ReplicationStatusKey.class,
+            ReplicationStatusVal.class,
+            null,
+            TableOptions.fromProtoSchema(LogReplicationMetadata.ReplicationStatusVal.class));
+
+        // Write batchSize num of entries to active map
+        for (int i = 0; i < batchSize; i++) {
+            try (TxnContext txn = corfuStoreActive.txn(NAMESPACE)) {
+                txn.putRecord(mapActive, StringKey.newBuilder().setKey(String.valueOf(i)).build(),
+                    IntValue.newBuilder().setValue(i).build(), null);
+                txn.commit();
+            }
+        }
+        assertThat(mapActive.count()).isEqualTo(batchSize);
+        assertThat(mapStandby.count()).isZero();
+
+        // Start LR on both sides.  Introduce a latency of 20 seconds when Active is in negotiating state
+        int waitInNegotiatingStateMs = 20000;
+        startActiveLogReplicator(waitInNegotiatingStateMs);
+        startStandbyLogReplicator();
+
+        // Wait for 10 seconds for the Active to reach Negotiating State.
+        // Note: This wait time was empirically determined and may require to be changed if source code behavior
+        // changes in future.
+        TimeUnit.SECONDS.sleep(10);
+
+        // Shutdown LR on the Standby for 5 seconds to cause a connection loss
+        shutdownCorfuServer(standbyReplicationServer);
+        TimeUnit.SECONDS.sleep(5);
+
+        // Subscribe listener to know when data is consistent on the Standby.  This would indicate a successful sync
+        // on reconnection after Standby starts.
+        CountDownLatch awaitSyncCompletion = new CountDownLatch(1);
+        DataConsistentListener standbyListener = new DataConsistentListener(awaitSyncCompletion);
+        corfuStoreStandby.subscribeListener(standbyListener, LogReplicationMetadataManager.NAMESPACE,
+            LogReplicationMetadataManager.LR_STATUS_STREAM_TAG);
+
+        // Start LR on the Standby
+        startStandbyLogReplicator();
+
+        // Wait for successful sync
+        awaitSyncCompletion.await();
+        tearDown();
+    }
+
+    /**
+     * This test verifies that concurrent Snapshot Syncs are handled gracefully on the Standby.  If messages from
+     * a new Snapshot Sync are received on the Standby when it is in 'apply' phase of a previous sync, these new
+     * messages are rejected.  This avoids the race between transfer and apply phases on Standby.
+     * The Active will continue to re-send messages from the new sync.  They will be accepted and ACK'd by Standby
+     * after the ongoing apply finishes.
+     *
+     * Test workflow:
+     * 1. Create a topology with Active and Standby.  On Standby, introduce a 20 sec latency during apply phase to
+     *    simulate the above race.  Wait for initial snapshot sync to complete.
+     * 2. Trigger 2 forced snapshot sync events with a delay of 3 seconds between requests.  This is to ensure that
+     *    the 1st request completes transfer and Standby is in 'apply' phase of the 1st sync.
+     * 3. When the 2nd forced sync is triggered, Active will be in WaitSnapshotApplyState due to the 'apply delay'
+     *    on Standby.  When the 2nd forced sync starts, the 1st one gets cancelled on Active.  Standby continues
+     *    to apply data from the 1st sync, rejecting incoming messages from the 2nd one.  Active continues to
+     *    resend these messages from the 2nd sync request.
+     *    Eventually, the apply phase of the 1st sync completes and Standby accepts messages from the 2nd one.
+     4.   When this 2nd sync completes on the Standby, all existing forced sync events are deleted from the Event
+     *    table.  Wait for the table to be empty, which indicates that this 2nd sync completed successfully.
+     * @throws Exception
+     */
+    @Test
+    public void testConcurrentSnapshotSyncOnStandby() throws Exception {
+        String testStreamName = "Table001";
+        int batchSize = 5;
+        int numForcedSyncEvents = 2;
+
+        // Time delay of 20 seconds introduced on the Standby when in Apply phase
+        int waitSnapshotApplyMs = 20000;
+
+        // Time delay of 3 seconds between requesting 2 consecutive forced syncs.  This is to ensure that the first
+        // sync request reaches the WaitForSnapshotApplyState (implies that the Standby will be in the Apply phase)
+        int waitTimeBetweenSyncRequestsMs = 3000;
+
+        // Perform initial setup and wait for initial snapshot sync to complete
+        try {
+            setupActiveAndStandbyCorfu();
+
+            Table<LogReplicationMetadata.ReplicationEventKey, LogReplicationMetadata.ReplicationEvent, Message> eventTable =
+                corfuStoreActive.openTable(LogReplicationMetadataManager.NAMESPACE,
+                    REPLICATION_EVENT_TABLE_NAME,
+                    LogReplicationMetadata.ReplicationEventKey.class,
+                    LogReplicationMetadata.ReplicationEvent.class,
+                    null,
+                    TableOptions.fromProtoSchema(LogReplicationMetadata.ReplicationEvent.class));
+
+            Table<StringKey, IntValue, Metadata> mapActive = corfuStoreActive.openTable(
+                NAMESPACE,
+                testStreamName,
+                StringKey.class,
+                IntValue.class,
+                Metadata.class,
+                TableOptions.builder().schemaOptions(
+                        CorfuOptions.SchemaOptions.newBuilder()
+                            .setIsFederated(true)
+                            .addStreamTag(ObjectsView.LOG_REPLICATOR_STREAM_INFO.getTagName())
+                            .build())
+                    .build()
+            );
+
+            Table<StringKey, IntValue, Metadata> mapStandby = corfuStoreStandby.openTable(
+                NAMESPACE,
+                testStreamName,
+                StringKey.class,
+                IntValue.class,
+                Metadata.class,
+                TableOptions.builder().schemaOptions(
+                        CorfuOptions.SchemaOptions.newBuilder()
+                            .setIsFederated(true)
+                            .addStreamTag(ObjectsView.LOG_REPLICATOR_STREAM_INFO.getTagName())
+                            .build())
+                    .build()
+            );
+
+            // Write batchSize num of entries to active map
+            for (int i = 0; i < batchSize; i++) {
+                try (TxnContext txn = corfuStoreActive.txn(NAMESPACE)) {
+                    txn.putRecord(mapActive, StringKey.newBuilder().setKey(String.valueOf(i)).build(),
+                        IntValue.newBuilder().setValue(i).build(), null);
+                    txn.commit();
+                }
+            }
+            assertThat(mapActive.count()).isEqualTo(batchSize);
+            assertThat(mapStandby.count()).isZero();
+
+            // Start LR on both sides.  Introduce a latency of 20 seconds in the apply phase on Standby
+            startActiveLogReplicator();
+            startStandbyLogReplicator(waitSnapshotApplyMs);
+            log.info("Replication servers started, and replication is in progress...");
+
+            // Wait for replication to finish and check sink has all the writes
+            while (mapStandby.count() != mapActive.count()) {
+                log.debug("Waiting for entries to be replicated");
+            }
+            assertThat(mapStandby.count()).isEqualTo(mapActive.count());
+
+            // Check that the event table is empty to begin with
+            assertThat(eventTable.count()).isZero();
+
+            // Add 2 full sync events with delay of 'waitTimeBetweenSyncRequestsMs'
+            Table<ClusterUuidMsg, ClusterUuidMsg, ClusterUuidMsg> configTable = corfuStoreActive.openTable(
+                DefaultClusterManager.CONFIG_NAMESPACE, DefaultClusterManager.CONFIG_TABLE_NAME,
+                ClusterUuidMsg.class, ClusterUuidMsg.class, ClusterUuidMsg.class,
+                TableOptions.fromProtoSchema(ClusterUuidMsg.class)
+            );
+
+            for (int i = 0; i < numForcedSyncEvents; i++) {
+                try (TxnContext txn = corfuStoreActive.txn(DefaultClusterManager.CONFIG_NAMESPACE)) {
+                    txn.putRecord(configTable, DefaultClusterManager.OP_ENFORCE_SNAPSHOT_FULL_SYNC,
+                        DefaultClusterManager.OP_ENFORCE_SNAPSHOT_FULL_SYNC, DefaultClusterManager.OP_ENFORCE_SNAPSHOT_FULL_SYNC);
+                    txn.commit();
+                }
+                TimeUnit.MILLISECONDS.sleep(waitTimeBetweenSyncRequestsMs);
+            }
+
+            // Wait for the forced sync events to be added to the event table
+            while(eventTable.count() < numForcedSyncEvents) {
+                log.info("Num Forced Sync Events Added: {}.  Expected {}", eventTable.count(), numForcedSyncEvents);
+            }
+
+            log.info("Forced Sync Events written to the table and will execute concurrently");
+
+            // When the 2nd forced sync is triggered, Active will be in WaitSnapshotApplyState due to the 'apply delay'
+            // on Standby.  When the 2nd forced sync starts, the 1st one gets cancelled on Active.  Standby continues
+            // to apply data from the 1st sync, rejecting incoming messages from the 2nd one.  Active continues to
+            // resend these messages.
+            // Eventually, the apply phase of the 1st sync completes and Standby accepts messages from the 2nd one.
+            // When this 2nd sync completes on the Standby, all existing forced sync events are deleted from the Event
+            // table.
+            // Wait for the table to be empty, which indicates that this 2nd sync completed successfully.
+            while(eventTable.count() > 0) {
+                log.debug("Waiting for the Event Table to be cleared.  Current Size = {}", eventTable.count());
+            }
+
+            // Verify that data is consistent on the Standby
+            corfuStoreStandby.openTable(LogReplicationMetadataManager.NAMESPACE,
+                REPLICATION_STATUS_TABLE,
+                ReplicationStatusKey.class,
+                ReplicationStatusVal.class,
+                null,
+                TableOptions.fromProtoSchema(LogReplicationMetadata.ReplicationStatusVal.class));
+            ReplicationStatusKey key = ReplicationStatusKey.newBuilder().setClusterId(
+                DefaultClusterConfig.getStandbyClusterId()).build();
+            try (TxnContext txnContext = corfuStoreStandby.txn(LogReplicationMetadataManager.NAMESPACE)) {
+                ReplicationStatusVal val =
+                    (ReplicationStatusVal) txnContext.getRecord(REPLICATION_STATUS_TABLE, key).getPayload();
+                Assert.assertTrue(val.getDataConsistent());
+            }
+
+        } finally {
+            executorService.shutdownNow();
+
+            if (activeCorfu != null) {
+                activeCorfu.destroy();
+            }
+
+            if (standbyCorfu != null) {
+                standbyCorfu.destroy();
+            }
+
+            if (activeReplicationServer != null) {
+                activeReplicationServer.destroy();
+            }
+
+            if (standbyReplicationServer != null) {
+                standbyReplicationServer.destroy();
+            }
+        }
+    }
+
+    /**
+     * Verify event table is cleared after processing latest force sync event to avoid keeping older events.
+     *
+     */
+    @Test
+    public void testEventTableCleared() throws Exception {
+        String testStreamName = "Table001";
+        int batchSize = 5;
+        int numStaleEvents = 3;
+
+        try {
+            setupActiveAndStandbyCorfu();
+
+            Table<LogReplicationMetadata.ReplicationEventKey, LogReplicationMetadata.ReplicationEvent, Message> eventTable =
+                    corfuStoreActive.openTable(LogReplicationMetadataManager.NAMESPACE,
+                            REPLICATION_EVENT_TABLE_NAME,
+                            LogReplicationMetadata.ReplicationEventKey.class,
+                            LogReplicationMetadata.ReplicationEvent.class,
+                            null,
+                            TableOptions.fromProtoSchema(LogReplicationMetadata.ReplicationEvent.class));
+
+            Table<StringKey, IntValue, Metadata>  mapActive = corfuStoreActive.openTable(
+                    NAMESPACE,
+                    testStreamName,
+                    StringKey.class,
+                    IntValue.class,
+                    Metadata.class,
+                    TableOptions.builder().schemaOptions(
+                                    CorfuOptions.SchemaOptions.newBuilder()
+                                            .setIsFederated(true)
+                                            .addStreamTag(ObjectsView.LOG_REPLICATOR_STREAM_INFO.getTagName())
+                                            .build())
+                            .build()
+            );
+
+            Table<StringKey, IntValue, Metadata>  mapStandby = corfuStoreStandby.openTable(
+                    NAMESPACE,
+                    testStreamName,
+                    StringKey.class,
+                    IntValue.class,
+                    Metadata.class,
+                    TableOptions.builder().schemaOptions(
+                                    CorfuOptions.SchemaOptions.newBuilder()
+                                            .setIsFederated(true)
+                                            .addStreamTag(ObjectsView.LOG_REPLICATOR_STREAM_INFO.getTagName())
+                                            .build())
+                            .build()
+            );
+
+            // Write batchSize num of entries to active map
+            for (int i = 0; i < batchSize; i++) {
+                try (TxnContext txn = corfuStoreActive.txn(NAMESPACE)) {
+                    txn.putRecord(mapActive, StringKey.newBuilder().setKey(String.valueOf(i)).build(),
+                            IntValue.newBuilder().setValue(i).build(), null);
+                    txn.commit();
+                }
+            }
+            assertThat(mapActive.count()).isEqualTo(batchSize);
+            assertThat(mapStandby.count()).isZero();
+
+            startActiveLogReplicator();
+            startStandbyLogReplicator();
+            log.info("Replication servers started, and replication is in progress...");
+
+            // Wait for replication to finish and check sink has all the writes
+            boolean entriesReplicated = false;
+            for(int i = 0; i < PARAMETERS.NUM_ITERATIONS_MODERATE; i++) {
+                if (mapStandby.count() == mapActive.count()) {
+                    entriesReplicated = true;
+                    break;
+                }
+                Thread.sleep(50);
+            }
+            assertThat(entriesReplicated).isTrue();
+
+            // Check that the event table is empty to begin
+            assertThat(eventTable.count()).isZero();
+
+            corfuStoreStandby.openTable(LogReplicationMetadataManager.NAMESPACE,
+                    REPLICATION_STATUS_TABLE,
+                    LogReplicationMetadata.ReplicationStatusKey.class,
+                    LogReplicationMetadata.ReplicationStatusVal.class,
+                    null,
+                    TableOptions.fromProtoSchema(LogReplicationMetadata.ReplicationStatusVal.class));
+
+            // Subscribe listener to know when data is consistent on the sink
+            CountDownLatch awaitSyncCompletion = new CountDownLatch(1);
+            DataConsistentListener standbyListener = new DataConsistentListener(awaitSyncCompletion);
+            corfuStoreStandby.subscribeListener(standbyListener, LogReplicationMetadataManager.NAMESPACE,
+                    LogReplicationMetadataManager.LR_STATUS_STREAM_TAG);
+
+            // Add some full sync events with an empty cluster ID, these will fail to run
+            for (int i = 0; i < numStaleEvents; i++) {
+                try (TxnContext txn = corfuStoreActive.txn(LogReplicationMetadataManager.NAMESPACE)) {
+                    ReplicationEventKey key = ReplicationEventKey.newBuilder().setKey(
+                            System.currentTimeMillis() + " " + DefaultClusterConfig.getStandbyClusterId()
+                    ).build();
+                    ReplicationEvent event = ReplicationEvent.newBuilder()
+                            .setEventId(UUID.randomUUID().toString())
+                            .build();
+
+                    txn.putRecord(eventTable, key, event, null);
+                    txn.commit();
+                }
+            }
+
+            Table<ClusterUuidMsg, ClusterUuidMsg, ClusterUuidMsg> configTable = corfuStoreActive.openTable(
+                    DefaultClusterManager.CONFIG_NAMESPACE, DefaultClusterManager.CONFIG_TABLE_NAME,
+                    ClusterUuidMsg.class, ClusterUuidMsg.class, ClusterUuidMsg.class,
+                    TableOptions.fromProtoSchema(ClusterUuidMsg.class)
+            );
+
+            // Enqueue one last force sync event through the config table, this will be the one to go through
+            try (TxnContext txn = corfuStoreActive.txn(DefaultClusterManager.CONFIG_NAMESPACE)) {
+                txn.putRecord(configTable, DefaultClusterManager.OP_ENFORCE_SNAPSHOT_FULL_SYNC,
+                        DefaultClusterManager.OP_ENFORCE_SNAPSHOT_FULL_SYNC, DefaultClusterManager.OP_ENFORCE_SNAPSHOT_FULL_SYNC);
+                txn.commit();
+            }
+
+            // Wait for last force sync event queued
+            boolean forceSyncQueued = false;
+            for(int i = 0; i < PARAMETERS.NUM_ITERATIONS_MODERATE; i++) {
+                if (eventTable.count() == numStaleEvents + 1) {
+                    forceSyncQueued = true;
+                    break;
+                }
+                Thread.sleep(50);
+            }
+            assertThat(forceSyncQueued).isTrue();
+
+            // Wait for the last force sync event to complete which should clear all events when done
+            awaitSyncCompletion.await();
+
+            // Check that the event table is cleared, could be small delay for clear after data is consistent
+            boolean tableCleared = false;
+            for(int i = 0; i < PARAMETERS.NUM_ITERATIONS_LOW; i++) {
+                if (eventTable.count() == 0) {
+                    tableCleared = true;
+                    break;
+                }
+                Thread.sleep(50);
+            }
+            assertThat(tableCleared).isTrue();
+        } finally {
+            executorService.shutdownNow();
+
+            if (activeCorfu != null) {
+                activeCorfu.destroy();
+            }
+
+            if (standbyCorfu != null) {
+                standbyCorfu.destroy();
+            }
+
+            if (activeReplicationServer != null) {
+                activeReplicationServer.destroy();
+            }
+
+            if (standbyReplicationServer != null) {
+                standbyReplicationServer.destroy();
+            }
+        }
+    }
+
     private long verifyReplicationStatus(ReplicationStatusVal.SyncType targetSyncType,
                                          LogReplicationMetadata.SyncStatus targetSyncStatus,
                                          LogReplicationMetadata.SnapshotSyncInfo.SnapshotSyncType targetSnapshotSyncType,
@@ -226,7 +662,7 @@ public class CorfuReplicationReconfigurationIT extends LogReplicationAbstractIT 
 
         ReplicationStatusVal replicationStatusVal;
         try (TxnContext txn = corfuStoreActive.txn(LogReplicationMetadataManager.NAMESPACE)) {
-            replicationStatusVal = (ReplicationStatusVal)txn.getRecord(LogReplicationMetadataManager.REPLICATION_STATUS_TABLE, key).getPayload();
+            replicationStatusVal = (ReplicationStatusVal)txn.getRecord(REPLICATION_STATUS_TABLE, key).getPayload();
             txn.commit();
         }
 
@@ -275,7 +711,7 @@ public class CorfuReplicationReconfigurationIT extends LogReplicationAbstractIT 
             setupActiveAndStandbyCorfu();
 
             log.debug("Open map on active and standby");
-            openMaps(DefaultLogReplicationConfigAdapter.MAP_COUNT, false);
+            openMaps(MAP_COUNT, false);
 
             // Subscribe to standby map 'Table002' (standbyIndex) to stop Standby LR as soon as updates are received,
             // forcing snapshot sync apply to be interrupted and resumed after LR standby is restarted
@@ -464,14 +900,18 @@ public class CorfuReplicationReconfigurationIT extends LogReplicationAbstractIT 
             setupActiveAndStandbyCorfu();
             openMaps();
 
-            Set<UUID> tablesToListen = new DefaultLogReplicationConfigAdapter().getStreamingConfigOnSink().keySet();
+            Set<UUID> tablesToListen = getTablesToListen();
 
             // Start Listener on the 'stream_tag' of interest, on standby site + tables to listen (which accounts
             // for the notification for 'clear' table)
             CountDownLatch streamingStandbySnapshotCompletion = new CountDownLatch(totalEntries*2 + tablesToListen.size());
+
+            // Countdown latch for the number of expected transactions to be received on the listener.  All updates
+            // in a table are applied in a single transaction so the expected number = numTablesToListen
+            CountDownLatch snapshotSyncNumTxLatch = new CountDownLatch(tablesToListen.size());
             StreamingStandbyListener listener = new StreamingStandbyListener(streamingStandbySnapshotCompletion,
-                    tablesToListen);
-            corfuStoreStandby.subscribeListener(listener, NAMESPACE, DefaultLogReplicationConfigAdapter.TAG_ONE);
+                snapshotSyncNumTxLatch, tablesToListen);
+            corfuStoreStandby.subscribeListener(listener, NAMESPACE, TAG_ONE);
 
             // Add Data for Snapshot Sync (before LR is started)
             writeToActiveDifferentTypes(0, totalEntries);
@@ -500,7 +940,7 @@ public class CorfuReplicationReconfigurationIT extends LogReplicationAbstractIT 
             // Wait until snapshot sync has completed
             // Open replication status table and monitor completion field
             corfuStoreActive.openTable(LogReplicationMetadataManager.NAMESPACE,
-                    LogReplicationMetadataManager.REPLICATION_STATUS_TABLE,
+                    REPLICATION_STATUS_TABLE,
                     LogReplicationMetadata.ReplicationStatusKey.class,
                     LogReplicationMetadata.ReplicationStatusVal.class,
                     null,
@@ -512,6 +952,7 @@ public class CorfuReplicationReconfigurationIT extends LogReplicationAbstractIT 
 
             log.info("** Wait for data change notifications (snapshot)");
             streamingStandbySnapshotCompletion.await();
+            snapshotSyncNumTxLatch.await();
             assertThat(listener.messages.size()).isEqualTo(totalEntries*2 + tablesToListen.size());
 
             // Verify both extra and local table are opened on Standby
@@ -520,9 +961,15 @@ public class CorfuReplicationReconfigurationIT extends LogReplicationAbstractIT 
 
             // Attach new listener for deltas (the same listener could be used) but simplifying the use of the latch
             CountDownLatch streamingStandbyDeltaCompletion = new CountDownLatch(totalEntries*2);
+
+            // The number of expected transactions to be received on the listener during delta sync.  The total
+            // number of transactions = numTablesToListen * entries written in each table.  In this test,
+            // 'totalEntries' are written to each table.
+            CountDownLatch logEntrySyncNumTxLatch = new CountDownLatch(totalEntries*tablesToListen.size());
+
             StreamingStandbyListener listenerDeltas = new StreamingStandbyListener(streamingStandbyDeltaCompletion,
-                    new DefaultLogReplicationConfigAdapter().getStreamingConfigOnSink().keySet());
-            corfuStoreStandby.subscribeListener(listenerDeltas, NAMESPACE, DefaultLogReplicationConfigAdapter.TAG_ONE);
+                logEntrySyncNumTxLatch, tablesToListen);
+            corfuStoreStandby.subscribeListener(listenerDeltas, NAMESPACE, TAG_ONE);
 
             // Add Delta's for Log Entry Sync
             writeToActiveDifferentTypes(totalEntries, totalEntries);
@@ -538,6 +985,7 @@ public class CorfuReplicationReconfigurationIT extends LogReplicationAbstractIT 
             // Block until all updates are received
             log.info("** Wait for data change notifications (delta)");
             streamingStandbyDeltaCompletion.await();
+            logEntrySyncNumTxLatch.await();
             assertThat(listenerDeltas.messages.size()).isEqualTo(totalEntries*2);
 
             // Add a delta to a 'mergeOnly' stream and confirm it is replicated. RegistryTable is a 'mergeOnly' stream
@@ -578,7 +1026,7 @@ public class CorfuReplicationReconfigurationIT extends LogReplicationAbstractIT 
 
         while (snapshotSyncCompleted) {
             try (TxnContext txn = corfuStoreActive.txn(LogReplicationMetadataManager.NAMESPACE)) {
-                replicationStatusVal = (ReplicationStatusVal) txn.getRecord(LogReplicationMetadataManager.REPLICATION_STATUS_TABLE, key).getPayload();
+                replicationStatusVal = (ReplicationStatusVal) txn.getRecord(REPLICATION_STATUS_TABLE, key).getPayload();
                 txn.commit();
             }
 
@@ -652,11 +1100,15 @@ public class CorfuReplicationReconfigurationIT extends LogReplicationAbstractIT 
         }
     }
 
+    /**
+     * Helper method for opening tables with is_federated flag to be true, which will be used to verify the registry
+     * table entries are correctly replicated.
+     */
     private void openTable(CorfuStore corfuStore, String tableName) throws Exception {
         corfuStore.openTable(
                 NAMESPACE, tableName,
                 Sample.StringKey.class, Sample.IntValueTag.class, Sample.Metadata.class,
-                TableOptions.builder().build()
+                TableOptions.fromProtoSchema(SampleTableAMsg.class)
         );
     }
 
@@ -677,8 +1129,8 @@ public class CorfuReplicationReconfigurationIT extends LogReplicationAbstractIT 
     }
 
     public void openMaps() throws Exception {
-        for (int i = 1; i <= DefaultLogReplicationConfigAdapter.MAP_COUNT; i++) {
-            String mapName = DefaultLogReplicationConfigAdapter.TABLE_PREFIX + i;
+        for (int i = 1; i <= MAP_COUNT; i++) {
+            String mapName = TABLE_PREFIX + i;
 
             if (i % 2 == 0) {
                 Table<Sample.StringKey, ValueFieldTagOne, Sample.Metadata> mapActive = corfuStoreActive.openTable(
@@ -744,40 +1196,40 @@ public class CorfuReplicationReconfigurationIT extends LogReplicationAbstractIT 
     }
 
     /**
-     * Stream Listener used for testing streaming on standby site. This listener decreases a latch
-     * until all expected updates are received/
+     * Stream listener that listens on the replication status and counts down it's latch on
+     * the dataConsistent field being set to true.
      */
-    public static class StreamingStandbyListener implements StreamListener {
+    class DataConsistentListener implements StreamListener {
 
-        private final CountDownLatch updatesLatch;
-        public List<CorfuStreamEntry> messages = new ArrayList<>();
-        private final Set<UUID> tablesToListenTo;
+        private CountDownLatch countDownLatch;
 
-        public StreamingStandbyListener(CountDownLatch updatesLatch, Set<UUID> tablesToListenTo) {
-            this.updatesLatch = updatesLatch;
-            this.tablesToListenTo = tablesToListenTo;
+        public DataConsistentListener(CountDownLatch countdownLatch) {
+            this.countDownLatch = countdownLatch;
         }
 
         @Override
-        public synchronized void onNext(CorfuStreamEntries results) {
-            log.info("StreamingStandbyListener:: onNext {} with entry size {}", results, results.getEntries().size());
-
-            results.getEntries().forEach((schema, entries) -> {
-                if (tablesToListenTo.contains(CorfuRuntime.getStreamID(NAMESPACE + "$" + schema.getTableName()))) {
-                    messages.addAll(entries);
-                    entries.forEach(e -> {
-                        if (e.getOperation() == CorfuStreamEntry.OperationType.CLEAR) {
-                            System.out.println("Clear operation for :: " + schema.getTableName() + " on address :: " + results.getTimestamp().getSequence() + " key :: " + e.getKey());
-                        }
-                        updatesLatch.countDown();
-                    });
+        public void onNext(CorfuStreamEntries results) {
+            results.getEntries().forEach((schema, entries) -> entries.forEach(e -> {
+                LogReplicationMetadata.ReplicationStatusVal statusVal = (LogReplicationMetadata.ReplicationStatusVal)e.getPayload();
+                if (statusVal.getDataConsistent()) {
+                    countDownLatch.countDown();
                 }
-            });
+            }));
         }
 
         @Override
         public void onError(Throwable throwable) {
-            log.error("ERROR :: unsubscribed listener");
+            Assert.fail("onError for DataConsistentListener : " + throwable.toString());
         }
+    }
+
+    private Set<UUID> getTablesToListen() {
+        String SEPARATOR = "$";
+        int indexOne = 1;
+        int indexTwo = 2;
+        Set<UUID> tablesToListen = new HashSet<>();
+        tablesToListen.add(CorfuRuntime.getStreamID(NAMESPACE + SEPARATOR + TABLE_PREFIX + indexOne));
+        tablesToListen.add(CorfuRuntime.getStreamID(NAMESPACE + SEPARATOR + TABLE_PREFIX + indexTwo));
+        return tablesToListen;
     }
 }

@@ -16,7 +16,7 @@
     <url>http://maven.apache.org</url>
 
     <properties>
-        <immutables.version>2.6.1</immutables.version>
+        <immutables.version>2.9.0</immutables.version>
     </properties>
     <dependencies>
         <dependency>
@@ -36,11 +36,6 @@
             <artifactId>value</artifactId>
             <version>${immutables.version}</version>
         </dependency>
-        <dependency>
-            <groupId>com.google.protobuf</groupId>
-            <artifactId>protobuf-java</artifactId>
-            <version>3.6.1</version>
-        </dependency>
  
     </dependencies>
 
@@ -57,7 +52,7 @@
                             <goal>run</goal>
                         </goals>
                         <configuration>
-                            <protocVersion>3.6.1</protocVersion>
+                            <protocVersion>${protobuf.version}</protocVersion>
                             <includeStdTypes>true</includeStdTypes>
                             <addProtoSources>inputs</addProtoSources>
                                 <includeMavenTypes>direct</includeMavenTypes>

@@ -1,10 +1,8 @@
 package org.corfudb.infrastructure.logreplication.runtime;
 
-import io.micrometer.core.instrument.Timer;
 import lombok.Getter;
 import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
-import org.corfudb.common.metrics.micrometer.MeterRegistryProvider;
 import org.corfudb.infrastructure.LogReplicationRuntimeParameters;
 import org.corfudb.infrastructure.logreplication.infrastructure.ClusterDescriptor;
 import org.corfudb.infrastructure.logreplication.infrastructure.plugins.LogReplicationPluginConfig;
@@ -96,11 +94,16 @@ public class LogReplicationClientRouter implements IClientRouter {
     public long timeoutResponse;
 
     /**
+     * Sync call connection timeout (milliseconds).
+     */
+    @Getter
+    @Setter
+    public long timeoutConnect;
+
+    /**
      * The outstanding requests on this router.
      */
     public final Map<Long, CompletableFuture> outstandingRequests;
-
-    private Optional<Timer.Sample> requestSample = Optional.empty();
 
     /**
      * Adapter to the channel implementation
@@ -134,6 +137,7 @@ public class LogReplicationClientRouter implements IClientRouter {
         this.remoteClusterId = remoteClusterDescriptor.getClusterId();
         this.parameters = parameters;
         this.timeoutResponse = parameters.getRequestTimeout().toMillis();
+        this.timeoutConnect = parameters.getConnectionTimeout().toMillis();
         this.runtimeFSM = runtimeFSM;
 
         this.handlerMap = new ConcurrentHashMap<>();
@@ -335,6 +339,13 @@ public class LogReplicationClientRouter implements IClientRouter {
     }
 
     @Override
+    public void reconnect() {
+        log.info("reconnect: reconnecting. Closing the existing channel.");
+        channelAdapter.stop();
+        connect();
+    }
+
+    @Override
     public Integer getPort() {
         // For logging purposes return one port (as this abstraction does not make sense for a Log Replication
         // Client Router) as it is a router to an entire cluster/site.
@@ -345,7 +356,7 @@ public class LogReplicationClientRouter implements IClientRouter {
     public String getHost() {
         String host = "";
         // For logging purposes return all remote cluster nodes host in a concatenated form
-        remoteClusterDescriptor.getNodesDescriptors().forEach(node -> host.concat(node.getHost() + ":"));
+        remoteClusterDescriptor.getNodesDescriptors().forEach(node -> host.concat(node.getHost() + ","));
         return host;
     }
 
@@ -372,13 +383,6 @@ public class LogReplicationClientRouter implements IClientRouter {
      */
     public void receive(CorfuMessage.ResponseMsg msg) {
         try {
-            requestSample.flatMap(sample -> MeterRegistryProvider.getInstance()
-                    .map(registry -> {
-                        Timer timer = registry
-                                .timer("logreplication.rtt.seconds");
-                        return sample.stop(timer);
-                    }));
-
             // If it is a Leadership Loss Message re-trigger leadership discovery
             if (msg.getPayload().getPayloadCase() == PayloadCase.LR_LEADERSHIP_LOSS) {
                 String nodeId = msg.getPayload().getLrLeadershipLoss().getNodeId();

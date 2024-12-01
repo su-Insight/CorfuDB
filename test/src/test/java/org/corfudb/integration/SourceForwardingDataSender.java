@@ -8,13 +8,13 @@ import org.corfudb.common.util.ObservableValue;
 import org.corfudb.infrastructure.logreplication.DataSender;
 import org.corfudb.infrastructure.logreplication.LogReplicationConfig;
 import org.corfudb.infrastructure.logreplication.proto.LogReplicationMetadata;
+import org.corfudb.infrastructure.logreplication.replication.LogReplicationSourceManager;
+import org.corfudb.infrastructure.logreplication.replication.fsm.ObservableAckMsg;
 import org.corfudb.infrastructure.logreplication.replication.receive.LogReplicationMetadataManager;
 import org.corfudb.infrastructure.logreplication.replication.receive.LogReplicationSinkManager;
-import org.corfudb.infrastructure.logreplication.replication.LogReplicationSourceManager;
 import org.corfudb.infrastructure.logreplication.replication.send.LogReplicationError;
-import org.corfudb.infrastructure.logreplication.replication.fsm.ObservableAckMsg;
-import org.corfudb.runtime.CorfuRuntime;
 import org.corfudb.integration.DefaultDataControl.DefaultDataControlConfig;
+import org.corfudb.runtime.CorfuRuntime;
 import org.corfudb.runtime.LogReplication;
 import org.corfudb.runtime.LogReplication.LogReplicationEntryMsg;
 import org.corfudb.runtime.LogReplication.LogReplicationEntryType;
@@ -36,7 +36,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * (for processing).
  */
 @Slf4j
-public class SourceForwardingDataSender extends AbstractIT implements DataSender {
+public class SourceForwardingDataSender implements DataSender {
 
     private final static int DROP_INCREMENT = 4;
 
@@ -91,9 +91,13 @@ public class SourceForwardingDataSender extends AbstractIT implements DataSender
 
     private CorfuStore standbyCorfuStore;
 
-    private final String destinationClusterID;
+    private final String destinationClusterId;
 
     private static final String REPLICATION_STATUS_TABLE = "LogReplicationStatus";
+
+    private LogReplicationIT.TestConfig testConfig;
+
+    private int numStartMsgsDropped;
 
     @SneakyThrows
     public SourceForwardingDataSender(String destinationEndpoint, LogReplicationConfig config, LogReplicationIT.TestConfig testConfig,
@@ -119,11 +123,27 @@ public class SourceForwardingDataSender extends AbstractIT implements DataSender
                 LogReplicationMetadata.ReplicationStatusVal.class,
                 null,
                 TableOptions.fromProtoSchema(LogReplicationMetadata.ReplicationStatusVal.class));
-        this.destinationClusterID = testConfig.getRemoteClusterId();
+        this.destinationClusterId = testConfig.getRemoteClusterId();
+        this.testConfig = testConfig;
     }
 
     @Override
     public CompletableFuture<LogReplicationEntryMsg> send(LogReplicationEntryMsg message) {
+        // Check if the SNAPSHOT_START message must be dropped
+        if (testConfig.isDropSnapshotStartMsg() && message.getMetadata().getEntryType() ==
+                LogReplicationEntryType.SNAPSHOT_START) {
+            if (testConfig.getNumDropsForSnapshotStart() != Integer.MAX_VALUE) {
+                // If a limited number of START messages must be dropped, drop them only if the number is yet to be
+                // reached
+                if (numStartMsgsDropped < testConfig.getNumDropsForSnapshotStart()) {
+                    numStartMsgsDropped++;
+                    return new CompletableFuture<>();
+                }
+            } else {
+                return new CompletableFuture<>();
+            }
+        }
+
         log.trace("Send message: " + message.getMetadata().getEntryType() + " for:: " + message.getMetadata().getTimestamp());
         if (ifDropMsg > 0 && msgCnt == droppingNum || dropACKLevel == 2 && message.getMetadata().getTimestamp() >= lastAckDropped) {
             log.info("****** Drop msg {} log entry ts {}",  msgCnt, message.getMetadata().getTimestamp());
@@ -144,7 +164,8 @@ public class SourceForwardingDataSender extends AbstractIT implements DataSender
                 ack = destinationLogReplicationManager.receive(message);
                 assertThat(ack.getMetadata().getTimestamp()).isEqualTo(message.getMetadata().getTimestamp());
             }
-            // test negative scenario: when a msg is ignored by Sink, the ACK received should not be for the ignored msg
+            // test negative scenario: send a msg with lower 'previousTimestamp' and no new data to apply.  Verify
+            // that last timestamp in the ACK remains the same.
             ack = destinationLogReplicationManager.receive(changeMsgMetadata(message));
             assertThat(ack.getMetadata().getTimestamp()).isEqualTo(message.getMetadata().getTimestamp());
         } else {
@@ -226,7 +247,7 @@ public class SourceForwardingDataSender extends AbstractIT implements DataSender
                     .setSnapshotStart(baseSnapshotTimestamp)
                     .setSnapshotTransferred(destinationLogReplicationManager.getLogReplicationMetadataManager().getLastTransferredSnapshotTimestamp())
                     .setSnapshotApplied(destinationLogReplicationManager.getLogReplicationMetadataManager().getLastAppliedSnapshotTimestamp())
-                    .setLastLogEntryTimestamp(destinationLogReplicationManager.getLogReplicationMetadataManager().getLastProcessedLogEntryTimestamp())
+                    .setLastLogEntryTimestamp(destinationLogReplicationManager.getLogReplicationMetadataManager().getLastProcessedLogEntryBatchTimestamp())
                     .build();
         }
 
@@ -289,23 +310,27 @@ public class SourceForwardingDataSender extends AbstractIT implements DataSender
         return false;
     }
 
-    /** Change the msg such that Sink ignores the msg. Used to test that the ACK received is not for this msg,
+    /** Change the msg such that Sink ignores the msg (previousTimestamp and current timestamp are decremented by 1,
+     * which means no new messages to apply). Used to test that the ACK received is not for this msg,
      * i.e., the lastProcessedTs on Sink doesn't change when the msg is ignored.
      **/
     private LogReplicationEntryMsg changeMsgMetadata(LogReplicationEntryMsg message) {
         LogReplicationEntryMsg newMessage = LogReplicationEntryMsg.newBuilder().mergeFrom(message)
                 .setMetadata(LogReplication.LogReplicationEntryMetadataMsg.newBuilder().mergeFrom(message.getMetadata())
-                        .setTimestamp(message.getMetadata().getTimestamp() + 1)
+                        .setTimestamp(message.getMetadata().getTimestamp() - 1)
                         .setPreviousTimestamp(message.getMetadata().getPreviousTimestamp() - 1)
                         .build())
                 .build();
 
         assertThat(destinationLogReplicationManager.getLogReplicationMetadataManager()
-                .getLastProcessedLogEntryTimestamp())
-                .isGreaterThanOrEqualTo(newMessage.getMetadata().getPreviousTimestamp());
+                .getLastProcessedLogEntryBatchTimestamp())
+                .isGreaterThan(newMessage.getMetadata().getPreviousTimestamp());
         assertThat(destinationLogReplicationManager.getLogReplicationMetadataManager()
-                .getLastProcessedLogEntryTimestamp())
-                .isLessThan(newMessage.getMetadata().getTimestamp());
+                .getLastProcessedLogEntryBatchTimestamp())
+                .isGreaterThan(newMessage.getMetadata().getTimestamp());
+        assertThat(destinationLogReplicationManager.getLogReplicationMetadataManager()
+                .getLastProcessedLogEntryBatchTimestamp())
+                .isEqualTo(message.getMetadata().getTimestamp());
 
         lastAckDropped = Long.MAX_VALUE;
 
@@ -313,11 +338,11 @@ public class SourceForwardingDataSender extends AbstractIT implements DataSender
     }
 
     public void checkStatusOnStandby(boolean expectedDataConsistent) {
-        if (destinationClusterID == null) {
+        if (destinationClusterId == null) {
             return;
         }
         LogReplicationMetadata.ReplicationStatusKey standbyClusterId = LogReplicationMetadata.ReplicationStatusKey.newBuilder()
-                .setClusterId(destinationClusterID)
+                .setClusterId(destinationClusterId)
                 .build();
         try (TxnContext txn = standbyCorfuStore.txn(LogReplicationMetadataManager.NAMESPACE)) {
             LogReplicationMetadata.ReplicationStatusVal standbyStatus = (LogReplicationMetadata.ReplicationStatusVal)txn.getRecord(REPLICATION_STATUS_TABLE, standbyClusterId).getPayload();

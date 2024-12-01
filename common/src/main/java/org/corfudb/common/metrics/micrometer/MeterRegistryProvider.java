@@ -3,7 +3,6 @@ package org.corfudb.common.metrics.micrometer;
 import io.micrometer.core.instrument.Meter;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Tag;
-
 import io.micrometer.core.instrument.composite.CompositeMeterRegistry;
 import io.micrometer.core.instrument.logging.LoggingRegistryConfig;
 import lombok.Getter;
@@ -13,9 +12,16 @@ import org.corfudb.common.metrics.micrometer.registries.RegistryLoader;
 import org.corfudb.common.metrics.micrometer.registries.RegistryProvider;
 import org.slf4j.Logger;
 
+import java.io.BufferedReader;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.HashMap;
 import java.util.Iterator;
+import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Supplier;
 
 /**
@@ -25,11 +31,12 @@ import java.util.function.Supplier;
 public class MeterRegistryProvider {
     @Getter
     private static CompositeMeterRegistry meterRegistry;
-    @Getter
+    private static final String PROVIDED_REGISTRY_DATA_FILE_PATH = "/registry.dat";
     private static Optional<String> id = Optional.empty();
-    @Getter
     private static Optional<MetricType> metricType = Optional.empty();
     private static Optional<RegistryProvider> provider = Optional.empty();
+    private static final Map<String, Supplier<String>> externalMetricsSuppliers
+            = new ConcurrentHashMap<>();
 
     private MeterRegistryProvider() {
 
@@ -89,7 +96,7 @@ public class MeterRegistryProvider {
             Supplier<Optional<MeterRegistry>> supplier = () -> {
                 LoggingRegistryConfig config = new IntervalLoggingConfig(loggingInterval);
                 LoggingMeterRegistryWithHistogramSupport registry =
-                        new LoggingMeterRegistryWithHistogramSupport(config, logger::debug);
+                        new LoggingMeterRegistryWithHistogramSupport(config, logger::debug, externalMetricsSuppliers);
                 registry.config().commonTags("id", identifier);
                 Optional<MeterRegistry> ret = Optional.of(registry);
                 JVMMetrics.register(ret);
@@ -99,19 +106,61 @@ public class MeterRegistryProvider {
             addToCompositeRegistry(supplier);
         }
 
-        private static synchronized void registerProvidedRegistries() {
-            RegistryLoader loader = new RegistryLoader();
-            Iterator<RegistryProvider> registries = loader.getRegistries();
-            while (registries.hasNext()) {
-                try {
-                    RegistryProvider registryProvider = registries.next();
-                    log.info("Registering provider: {}", registryProvider);
-                    provider = Optional.of(registryProvider);
-                    MeterRegistry registry = registryProvider.provideRegistry();
-                    addToCompositeRegistry(() -> Optional.of(registry));
-                } catch (Throwable exception) {
-                    log.error("Problems registering a registry", exception);
+        private static Map<String, String> loadRegistryData() {
+            Map<String, String> map = new HashMap<>();
+            try (InputStream inputStream = MeterRegistryProvider.class.getResourceAsStream(PROVIDED_REGISTRY_DATA_FILE_PATH)) {
+                if (inputStream != null) {
+                    try(BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream, StandardCharsets.UTF_8))) {
+                        String line;
+                        while ((line = reader.readLine()) != null) {
+                            if (line.contains("=")) {
+                                String[] split = line.split("=");
+                                if (split.length == 2) {
+                                    map.put(split[0], split[1]);
+                                }
+                            }
+                        }
+                    }
                 }
+                else {
+                    log.warn("Provided file not found: {}. Will return an empty map.", PROVIDED_REGISTRY_DATA_FILE_PATH);
+                }
+                return map;
+            } catch (Exception e) {
+                log.error("Problems loading registry data. Will return an empty map.", e);
+            }
+            return map;
+        }
+
+        private static synchronized void registerProvidedRegistries() {
+            final Map<String, String> registryMetadata = loadRegistryData();
+            if (!registryMetadata.isEmpty()) {
+                log.info("Registry metadata: {}", registryMetadata);
+                RegistryLoader loader = new RegistryLoader();
+                Iterator<RegistryProvider> registries = loader.getRegistries();
+                while (registries.hasNext()) {
+                    try {
+                        RegistryProvider registryProvider = registries.next();
+                        log.info("Registering provider: {}", registryProvider);
+                        provider = Optional.of(registryProvider);
+                        Optional<MeterRegistry> registry = registryProvider.provideRegistry(registryMetadata);
+                        if (registry.isPresent()) {
+                            MeterRegistry providedRegistry = registry.get();
+                            id.ifPresent(s -> providedRegistry.config().commonTags("id", s));
+                            addToCompositeRegistry(() -> registry);
+                        }
+                        else {
+                            log.warn("Registry was not configured");
+                        }
+
+                    }
+                    catch (Throwable exception) {
+                        log.error("Problems registering a registry", exception);
+                    }
+                }
+            }
+            else {
+                log.info("Registry metadata is empty. Skipping.");
             }
         }
 
@@ -158,7 +207,11 @@ public class MeterRegistryProvider {
      */
     public static synchronized void close() {
         meterRegistry.close();
-        meterRegistry.getRegistries().forEach(registry -> meterRegistry.remove(registry));
+        while(!meterRegistry.getRegistries().isEmpty()) {
+            Optional<MeterRegistry> toDelete = meterRegistry.getRegistries().stream().findFirst();
+            toDelete.ifPresent(registry -> meterRegistry.remove(registry));
+        }
+        externalMetricsSuppliers.clear();
         provider.ifPresent(RegistryProvider::close);
         provider = Optional.empty();
         metricType = Optional.empty();
@@ -172,6 +225,16 @@ public class MeterRegistryProvider {
      */
     public static synchronized Optional<MetricType> getMetricType() {
         return metricType;
+    }
+
+    public static void registerExternalSupplier(String identifier, Supplier<String> supplier) {
+        externalMetricsSuppliers.put(identifier, supplier);
+    }
+
+    public static void unregisterExternalSupplier(String identifier) {
+        synchronized (externalMetricsSuppliers) {
+            externalMetricsSuppliers.remove(identifier);
+        }
     }
 
     /**

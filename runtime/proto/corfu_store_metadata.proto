@@ -29,6 +29,8 @@ message TableDescriptors {
     google.protobuf.Any key = 2;
     google.protobuf.Any value = 3;
     google.protobuf.Any metadata = 4;
+
+    option (org.corfudb.runtime.table_schema).requires_backup_support = true;
 }
 
 // Metadata.
@@ -57,4 +59,7 @@ message ProtobufFileName {
 
 message ProtobufFileDescriptor {
     google.protobuf.FileDescriptorProto file_descriptor = 1;
+    fixed64 version = 2;
+
+    option (org.corfudb.runtime.table_schema).requires_backup_support = true;
 }

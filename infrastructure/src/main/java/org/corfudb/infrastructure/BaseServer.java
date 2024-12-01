@@ -1,10 +1,6 @@
 package org.corfudb.infrastructure;
 
 import io.netty.channel.ChannelHandlerContext;
-import java.lang.invoke.MethodHandles;
-import java.net.InetSocketAddress;
-import java.util.concurrent.ExecutorService;
-import javax.annotation.Nonnull;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 import org.corfudb.protocols.service.CorfuProtocolMessage.ClusterIdCheck;
@@ -15,6 +11,11 @@ import org.corfudb.runtime.proto.service.CorfuMessage.RequestMsg;
 import org.corfudb.runtime.proto.service.CorfuMessage.RequestPayloadMsg;
 import org.corfudb.runtime.proto.service.CorfuMessage.ResponseMsg;
 
+import javax.annotation.Nonnull;
+import java.lang.invoke.MethodHandles;
+import java.util.concurrent.ExecutorService;
+
+import static org.corfudb.common.util.URLUtils.getRemoteEndpointFromCtx;
 import static org.corfudb.protocols.CorfuProtocolServerErrors.getWrongEpochErrorMsg;
 import static org.corfudb.protocols.service.CorfuProtocolBase.getPingResponseMsg;
 import static org.corfudb.protocols.service.CorfuProtocolBase.getResetResponseMsg;
@@ -65,8 +66,8 @@ public class BaseServer extends AbstractServer {
      */
     @RequestHandler(type = RequestPayloadMsg.PayloadCase.PING_REQUEST)
     public void handlePing(RequestMsg req, ChannelHandlerContext ctx, IServerRouter r) {
-        log.trace("handlePing[{}]: Ping message received from {} {}", req.getHeader().getRequestId(),
-                req.getHeader().getClientId().getMsb(), req.getHeader().getClientId().getLsb());
+        log.trace("handlePing[{}]: Ping message received from {}",
+                req.getHeader().getRequestId(), getRemoteEndpointFromCtx(ctx));
 
         HeaderMsg responseHeader = getHeaderMsg(req.getHeader(), ClusterIdCheck.CHECK, EpochCheck.IGNORE);
         ResponseMsg response = getResponseMsg(responseHeader, getPingResponseMsg());
@@ -85,22 +86,17 @@ public class BaseServer extends AbstractServer {
     private synchronized void handleSeal(RequestMsg req, ChannelHandlerContext ctx, IServerRouter r) {
         try {
             final long epoch = req.getPayload().getSealRequest().getEpoch();
-            String remoteHostAddress;
-            try {
-                remoteHostAddress = ((InetSocketAddress)ctx.channel().remoteAddress()).getAddress().getHostAddress();
-            } catch (NullPointerException ex) {
-                remoteHostAddress = "unavailable";
-            }
 
-            log.info("handleSeal[{}]: Received SEAL from (clientId={}:{}), moving to new epoch {},",
-                    req.getHeader().getRequestId(), req.getHeader().getClientId(), remoteHostAddress, epoch);
+            log.info("handleSeal[{}]: Received SEAL from {}, moving to new epoch {},",
+                    req.getHeader().getRequestId(), getRemoteEndpointFromCtx(ctx), epoch);
 
             serverContext.setServerEpoch(epoch, r);
             HeaderMsg responseHeader = getHeaderMsg(req.getHeader(), ClusterIdCheck.CHECK, EpochCheck.IGNORE);
             ResponseMsg response = getResponseMsg(responseHeader, getSealResponseMsg());
             r.sendResponse(response, ctx);
         } catch (WrongEpochException e) {
-            log.debug("handleSeal[{}]: Rejected SEAL current={}, requested={}", req.getHeader().getRequestId(),
+            log.debug("handleSeal[{}]: Rejected SEAL from {} current={}, requested={}",
+                    req.getHeader().getRequestId(), getRemoteEndpointFromCtx(ctx),
                     e.getCorrectEpoch(), req.getPayload().getSealRequest().getEpoch());
 
             HeaderMsg responseHeader = getHeaderMsg(req.getHeader(), ClusterIdCheck.CHECK, EpochCheck.IGNORE);
@@ -110,9 +106,7 @@ public class BaseServer extends AbstractServer {
     }
 
     /**
-     * Reset the JVM. This mechanism leverages that corfu_server runs in a bash script
-     * which monitors the exit code of Corfu. If the exit code is 100, then it resets
-     * the server and DELETES ALL EXISTING DATA.
+     * Restart the CorfuServer and reset the server state by DELETING ALL EXISTING DATA.
      *
      * @param req The incoming request message.
      * @param ctx The channel context.
@@ -121,7 +115,7 @@ public class BaseServer extends AbstractServer {
     @RequestHandler(type = RequestPayloadMsg.PayloadCase.RESET_REQUEST)
     private void handleReset(RequestMsg req, ChannelHandlerContext ctx, IServerRouter r) {
         log.warn("handleReset[{}]: Remote reset requested from {}",
-                req.getHeader().getRequestId(), req.getHeader().getClientId());
+                req.getHeader().getRequestId(), getRemoteEndpointFromCtx(ctx));
 
         HeaderMsg responseHeader = getHeaderMsg(req.getHeader(), ClusterIdCheck.CHECK, EpochCheck.IGNORE);
         ResponseMsg response = getResponseMsg(responseHeader, getResetResponseMsg());
@@ -130,9 +124,7 @@ public class BaseServer extends AbstractServer {
     }
 
     /**
-     * Restart the JVM. This mechanism leverages that corfu_server runs in a bash script
-     * which monitors the exit code of Corfu. If the exit code is 200, then it restarts
-     * the server.
+     * Restart the CorfuServer. Do NOT reset any of the server state.
      *
      * @param req   The incoming request message.
      * @param ctx   The channel context.
@@ -141,7 +133,7 @@ public class BaseServer extends AbstractServer {
     @RequestHandler(type = RequestPayloadMsg.PayloadCase.RESTART_REQUEST)
     private void handleRestart(RequestMsg req, ChannelHandlerContext ctx, IServerRouter r) {
         log.warn("handleRestart[{}]: Remote restart requested from {}",
-                req.getHeader().getRequestId(), req.getHeader().getClientId());
+                req.getHeader().getRequestId(), getRemoteEndpointFromCtx(ctx));
 
         HeaderMsg responseHeader = getHeaderMsg(req.getHeader(), ClusterIdCheck.CHECK, EpochCheck.IGNORE);
         ResponseMsg response = getResponseMsg(responseHeader, getRestartResponseMsg());

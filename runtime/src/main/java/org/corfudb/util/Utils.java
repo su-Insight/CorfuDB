@@ -1,9 +1,15 @@
 package org.corfudb.util;
 
-import static com.google.common.base.Preconditions.checkArgument;
-import static com.google.common.base.Preconditions.checkNotNull;
-import static com.google.common.base.Preconditions.checkState;
-
+import lombok.extern.slf4j.Slf4j;
+import org.corfudb.protocols.wireprotocol.StreamsAddressResponse;
+import org.corfudb.protocols.wireprotocol.TailsResponse;
+import org.corfudb.protocols.wireprotocol.Token;
+import org.corfudb.runtime.clients.LogUnitClient;
+import org.corfudb.runtime.exceptions.WrongEpochException;
+import org.corfudb.runtime.view.Address;
+import org.corfudb.runtime.view.Layout;
+import org.corfudb.runtime.view.RuntimeLayout;
+import org.corfudb.runtime.view.stream.StreamAddressSpace;
 
 import java.text.DecimalFormat;
 import java.util.Comparator;
@@ -17,19 +23,10 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
-import jdk.internal.org.objectweb.asm.util.Printer;
-import jdk.internal.org.objectweb.asm.util.Textifier;
-import jdk.internal.org.objectweb.asm.util.TraceMethodVisitor;
-import lombok.extern.slf4j.Slf4j;
-import org.corfudb.protocols.wireprotocol.StreamsAddressResponse;
-import org.corfudb.protocols.wireprotocol.TailsResponse;
-import org.corfudb.protocols.wireprotocol.Token;
-import org.corfudb.runtime.clients.LogUnitClient;
-import org.corfudb.runtime.exceptions.WrongEpochException;
-import org.corfudb.runtime.view.Address;
-import org.corfudb.runtime.view.Layout;
-import org.corfudb.runtime.view.RuntimeLayout;
-import org.corfudb.runtime.view.stream.StreamAddressSpace;
+
+import static com.google.common.base.Preconditions.checkArgument;
+import static com.google.common.base.Preconditions.checkNotNull;
+import static com.google.common.base.Preconditions.checkState;
 
 /**
  * Created by crossbach on 5/22/15.
@@ -40,9 +37,6 @@ public class Utils {
     private Utils() {
         // prevent instantiation of this class
     }
-
-    private static final Printer printer = new Textifier();
-    private static final TraceMethodVisitor mp = new TraceMethodVisitor(printer);
 
     private static final char[] hexArray = "0123456789ABCDEF".toCharArray();
 
@@ -59,12 +53,14 @@ public class Utils {
         return new UUID(msb, lsb);
     }
 
-    /** Convert a byte array to a hex string.
+    /**
+     * Convert a byte array to a hex string.
      * Source:
-     * https://stackoverflow.com/questions/9655181/
+     * <a href="https://stackoverflow.com/questions/9655181/">stackoverflow</a>
      * how-to-convert-a-byte-array-to-a-hex-string-in-java
+     *
      * @param bytes Byte array to convert
-     * @return      Hex string representation.
+     * @return Hex string representation.
      */
     public static String bytesToHex(byte[] bytes) {
         if (bytes == null) {
@@ -102,7 +98,10 @@ public class Utils {
 
     /**
      * Convert to byte string representation.
-     * from http://stackoverflow.com/questions/3758606/how-to-convert-byte-size-into-human-readable-format-in-java
+     * from
+     * <a href="http://stackoverflow.com/questions/3758606/how-to-convert-byte-size-into-human-readable-format-in-java">
+     *     stackoverflow
+     * </a>
      *
      * @param value The value to convert.
      * @return A string for bytes (i.e, 10GB).
@@ -124,6 +123,20 @@ public class Utils {
             }
         }
         return result;
+    }
+
+    public static boolean startsWith(byte[] array, byte[] prefix) {
+        if (array == null || prefix == null || array.length < prefix.length) {
+            return false;
+        }
+
+        for (int i = 0; i < prefix.length; i++) {
+            if (array[i] != prefix[i]) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /**

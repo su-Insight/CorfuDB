@@ -1,22 +1,19 @@
 package org.corfudb.runtime.object.transactions;
 
-import static org.assertj.core.api.Assertions.assertThat;
 import com.google.common.reflect.TypeToken;
-
-import java.util.ArrayList;
-import java.util.Map;
-import java.util.concurrent.atomic.AtomicIntegerArray;
-import java.util.concurrent.atomic.AtomicLong;
-
 import org.corfudb.protocols.wireprotocol.ILogData;
 import org.corfudb.protocols.wireprotocol.Token;
 import org.corfudb.protocols.wireprotocol.TokenResponse;
 import org.corfudb.runtime.collections.ICorfuTable;
-import org.corfudb.runtime.collections.CorfuTable;
-import org.corfudb.runtime.object.CorfuSharedCounter;
+import org.corfudb.runtime.collections.PersistentCorfuTable;
 import org.corfudb.runtime.view.Address;
 import org.junit.Before;
 import org.junit.Test;
+
+import java.util.concurrent.atomic.AtomicIntegerArray;
+import java.util.concurrent.atomic.AtomicLong;
+
+import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * Created by mwei on 11/21/16.
@@ -33,15 +30,15 @@ public abstract class AbstractTransactionContextTest extends AbstractTransaction
     public ICorfuTable<String, String> getMap() {
         if (testMap == null) {
             testMap = (ICorfuTable<String, String>) instantiateCorfuObject(
-                    new TypeToken<CorfuTable<String, String>>() {},
+                    new TypeToken<PersistentCorfuTable<String, String>>() {},
                     "test stream"
             );
         }
         return testMap;
     }
 
-    String put(String key, String value) {
-        return getMap().put(key, value);
+    void put(String key, String value) {
+        getMap().insert(key, value);
     }
 
     String get(String key) {
@@ -60,31 +57,9 @@ public abstract class AbstractTransactionContextTest extends AbstractTransaction
     static final int OVERWRITE_TWICE = 34;
 
     int numTasks;
-    ArrayList<CorfuSharedCounter> sharedCounters;
     AtomicIntegerArray commitStatus;
     final int COMMITVALUE = 1; // by default, ABORTVALUE = 0
     AtomicIntegerArray snapStatus;
-
-    /**
-     * build an array of shared counters for the test
-     */
-    void setupCounters() {
-
-        numTasks = PARAMETERS.NUM_ITERATIONS_MODERATE;
-        sharedCounters = new ArrayList<>();
-
-        for (int i = 0; i < numTasks; i++)
-            sharedCounters.add(i,
-                    instantiateCorfuObject(CorfuSharedCounter.class, "test"+i)
-            );
-
-        // initialize all shared counters
-        for (int i = 0; i < numTasks; i++)
-            sharedCounters.get(i).setValue(INITIAL);
-
-        commitStatus = new AtomicIntegerArray(numTasks);
-        snapStatus = new AtomicIntegerArray(numTasks);
-    }
 
     /** Ensure that empty write sets are not written to the log.
      * This test applies to all contexts which is why it is in
@@ -93,16 +68,13 @@ public abstract class AbstractTransactionContextTest extends AbstractTransaction
     @Test
     public void ensureEmptyWriteSetIsNotWritten() {
         TXBegin();
-        long result = getRuntime().getObjectsView().TXEnd();
+        getRuntime().getObjectsView().TXEnd();
         ILogData ld =
                 getRuntime()
                         .getAddressSpaceView()
                         .peek(0);
         assertThat(ld)
                 .isNull();
-
-        assertThat(result)
-                .isEqualTo(Address.NON_ADDRESS);
     }
 
     /**
@@ -113,10 +85,10 @@ public abstract class AbstractTransactionContextTest extends AbstractTransaction
      */
     @Test
     public void testReadOnlyTransactionsCommitAddress() throws Exception {
-        Map<String, String> map = getMap();
-        map.put("k1", "v1");
+        ICorfuTable<String, String> map = getMap();
+        map.insert("k1", "v1");
         Token snapshot1 = getRuntime().getSequencerView().query().getToken();
-        map.put("k2", "v2");
+        map.insert("k2", "v2");
         Token snapshot2 = getRuntime().getSequencerView().query().getToken();
 
         AtomicLong otherThreadCommitAddress = new AtomicLong(Address.NON_ADDRESS);

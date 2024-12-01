@@ -6,7 +6,6 @@ import org.corfudb.protocols.wireprotocol.orchestrator.CreateWorkflowResponse;
 import org.corfudb.runtime.CorfuRuntime;
 import org.corfudb.runtime.clients.BaseClient;
 import org.corfudb.runtime.clients.ManagementClient;
-import org.corfudb.runtime.exceptions.NetworkException;
 import org.corfudb.runtime.view.Layout;
 import org.corfudb.util.CFUtils;
 import org.corfudb.util.Sleep;
@@ -28,7 +27,7 @@ public class AddNode extends WorkflowRequest {
     /**
      * Number of retries to ping a base server before selecting an orchestrator.
      */
-    private final int pingRetries = 3;
+    private final int pingRetries = 10;
     /**
      * Duration between the pings.
      */

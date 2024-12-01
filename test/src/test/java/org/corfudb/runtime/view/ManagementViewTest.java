@@ -14,8 +14,8 @@ import org.corfudb.protocols.wireprotocol.TokenResponse;
 import org.corfudb.protocols.wireprotocol.failuredetector.NodeConnectivity.NodeConnectivityType;
 import org.corfudb.runtime.CorfuRuntime;
 import org.corfudb.runtime.clients.TestRule;
-import org.corfudb.runtime.collections.CorfuTable;
 import org.corfudb.runtime.collections.ICorfuTable;
+import org.corfudb.runtime.collections.PersistentCorfuTable;
 import org.corfudb.runtime.exceptions.AbortCause;
 import org.corfudb.runtime.exceptions.ServerNotReadyException;
 import org.corfudb.runtime.exceptions.TransactionAbortedException;
@@ -26,9 +26,11 @@ import org.corfudb.runtime.view.ClusterStatusReport.ClusterStatus;
 import org.corfudb.runtime.view.ClusterStatusReport.ConnectivityStatus;
 import org.corfudb.runtime.view.ClusterStatusReport.NodeStatus;
 import org.corfudb.runtime.view.stream.IStreamView;
+import org.corfudb.util.Sleep;
 import org.junit.Assert;
 import org.junit.Test;
 
+import java.time.Duration;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
@@ -547,11 +549,19 @@ public class ManagementViewTest extends AbstractViewTest {
     }
 
     protected <T extends ICorfuSMR> Object instantiateCorfuObject(TypeToken<T> tType, String name) {
-        return getCorfuRuntime().getObjectsView()
-                .build()
-                .setStreamName(name)     // stream name
-                .setTypeToken(tType)    // a TypeToken of the specified class
-                .open();                // instantiate the object!
+        if (tType.getRawType() == PersistentCorfuTable.class) {
+            return getCorfuRuntime().getObjectsView()
+                    .build()
+                    .setStreamName(name)     // stream name
+                    .setTypeToken(tType)    // a TypeToken of the specified class
+                    .open();                // instantiate the object!
+        } else {
+            return getCorfuRuntime().getObjectsView()
+                    .build()
+                    .setStreamName(name)     // stream name
+                    .setTypeToken(tType)    // a TypeToken of the specified class
+                    .open();                // instantiate the object!
+        }
     }
 
 
@@ -559,7 +569,7 @@ public class ManagementViewTest extends AbstractViewTest {
         ICorfuTable<Integer, String> testMap;
 
         testMap = (ICorfuTable<Integer, String>) instantiateCorfuObject(
-                new TypeToken<CorfuTable<Integer, String>>() {
+                new TypeToken<PersistentCorfuTable<Integer, String>>() {
                 }, "test stream"
         );
 
@@ -582,7 +592,7 @@ public class ManagementViewTest extends AbstractViewTest {
         // setup 3-Corfu node cluster
         getManagementTestLayout();
 
-        Map<Integer, String> map = getMap();
+        ICorfuTable<Integer, String> map = getMap();
 
         // start a transaction and force it to obtain snapshot timestamp
         // preceding the sequencer failover
@@ -597,7 +607,7 @@ public class ManagementViewTest extends AbstractViewTest {
         // in another thread, fill the log with a few entries
         t(1, () -> {
             for (int i = 0; i < nUpdates; i++)
-                map.put(i, payload);
+                map.insert(i, payload);
         });
 
         // now, the tail of the log is at nUpdates;
@@ -608,7 +618,7 @@ public class ManagementViewTest extends AbstractViewTest {
         induceSequencerFailureAndWait();
         t(0, () -> {
             boolean commit = true;
-            map.put(nUpdates + 1, payload); // should not conflict
+            map.insert(nUpdates + 1, payload); // should not conflict
             try {
                 TXEnd();
             } catch (TransactionAbortedException ta) {
@@ -628,12 +638,12 @@ public class ManagementViewTest extends AbstractViewTest {
         // in another thread, fill the log with a few entries
         t(1, () -> {
             for (int i = 0; i < nUpdates; i++)
-                map.put(i, payload + 1);
+                map.insert(i, payload + 1);
         });
 
         t(0, () -> {
             boolean commit = true;
-            map.put(nUpdates + 1, payload); // should not conflict
+            map.insert(nUpdates + 1, payload); // should not conflict
             try {
                 TXEnd();
             } catch (TransactionAbortedException ta) {
@@ -652,12 +662,12 @@ public class ManagementViewTest extends AbstractViewTest {
     public void ckSequencerFailoverTXResolution1() throws Exception {
         getManagementTestLayout();
 
-        Map<Integer, String> map = getMap();
+        ICorfuTable<Integer, String> map = getMap();
         final String payload = "hello";
         final int nUpdates = 5;
 
         for (int i = 0; i < nUpdates; i++)
-            map.put(i, payload);
+            map.insert(i, payload);
 
         // start a transaction and force it to obtain snapshot timestamp
         // preceding the sequencer failover
@@ -669,7 +679,7 @@ public class ManagementViewTest extends AbstractViewTest {
         // in another thread, fill the log with a few entries
         t(1, () -> {
             for (int i = 0; i < nUpdates; i++)
-                map.put(i, payload + 1);
+                map.insert(i, payload + 1);
         });
 
         // now, the tail of the log is at nUpdates;
@@ -681,7 +691,7 @@ public class ManagementViewTest extends AbstractViewTest {
 
         t(0, () -> {
             boolean commit = true;
-            map.put(nUpdates + 1, payload); // should not conflict
+            map.insert(nUpdates + 1, payload); // should not conflict
             try {
                 TXEnd();
             } catch (TransactionAbortedException ta) {
@@ -701,12 +711,12 @@ public class ManagementViewTest extends AbstractViewTest {
         // in another thread, fill the log with a few entries
         t(1, () -> {
             for (int i = 0; i < nUpdates; i++)
-                map.put(i, payload + 2);
+                map.insert(i, payload + 2);
         });
 
         t(0, () -> {
             boolean commit = true;
-            map.put(nUpdates + 1, payload); // should not conflict
+            map.insert(nUpdates + 1, payload); // should not conflict
             try {
                 TXEnd();
             } catch (TransactionAbortedException ta) {
@@ -1578,10 +1588,10 @@ public class ManagementViewTest extends AbstractViewTest {
      *
      * @param table CorfuTable to populate.
      */
-    private void writeRandomEntryToTable(CorfuTable table) {
+    private void writeRandomEntryToTable(ICorfuTable table) {
         Random r = new Random();
         corfuRuntime.getObjectsView().TXBegin();
-        table.put(r.nextInt(), r.nextInt());
+        table.insert(r.nextInt(), r.nextInt());
         corfuRuntime.getObjectsView().TXEnd();
     }
 
@@ -1596,8 +1606,8 @@ public class ManagementViewTest extends AbstractViewTest {
     public void testSequencerCacheOverflowOnFailover() throws Exception {
         corfuRuntime = getDefaultRuntime();
 
-        CorfuTable<String, String> table = corfuRuntime.getObjectsView().build()
-                .setTypeToken(new TypeToken<CorfuTable<String, String>>() {
+        ICorfuTable<String, String> table = corfuRuntime.getObjectsView().build()
+                .setTypeToken(new TypeToken<PersistentCorfuTable<String, String>>() {
                 })
                 .setStreamName("test")
                 .open();
@@ -1673,5 +1683,73 @@ public class ManagementViewTest extends AbstractViewTest {
         addClientRule(corfuRuntime, new TestRule().requestMatches(msg ->
                 msg.getPayload().getPayloadCase().equals(PayloadCase.BOOTSTRAP_MANAGEMENT_REQUEST)).drop());
         assertThat(corfuRuntime.getLayoutManagementView().bootstrapNewNode(SERVERS.ENDPOINT_1).join()).isTrue();
+    }
+
+    /**
+     * Test that a 3-node cluster can recover when one node is marked unresponsive,
+     * but that COMMIT_LAYOUT is *only* received by this unresponsive node after prior
+     * consensus steps are complete. Thw two remaining responsive nodes will have
+     * the older layout with a stale epoch.
+     */
+    @Test
+    public void testPartialCommitSameNodeUnresponsive() throws Exception {
+        // Bootstrap a 3-node cluster where all nodes are responsive and on the same epoch.
+        final Layout startingLayout  = get3NodeLayout();
+        final long startingEpoch = startingLayout.getEpoch();
+        final int numWrites = 200;
+
+        final ICorfuTable<String, String> testTable = getCorfuRuntime().getObjectsView()
+                .build()
+                .setTypeToken(new TypeToken<PersistentCorfuTable<String, String>>() {})
+                .setStreamID(UUID.randomUUID())
+                .open();
+
+        for (int i = 0; i < numWrites; i++) {
+            getCorfuRuntime().getObjectsView().TXBegin();
+            testTable.insert(Integer.toString(i), Integer.toString(i));
+            getCorfuRuntime().getObjectsView().TXEnd();
+        }
+
+        // Block PORT_0 from receiving SEAL, PREPARE_LAYOUT, PROPOSE_LAYOUT, COMMIT_LAYOUT and BOOTSTRAP_SEQUENCER.
+        addServerRule(SERVERS.PORT_0, new TestRule().requestMatches(msg ->
+                msg.getPayload().getPayloadCase().equals(PayloadCase.SEAL_REQUEST)).drop());
+        addServerRule(SERVERS.PORT_0, new TestRule().requestMatches(msg ->
+                msg.getPayload().getPayloadCase().equals(PayloadCase.PREPARE_LAYOUT_REQUEST)).drop());
+        addServerRule(SERVERS.PORT_0, new TestRule().requestMatches(msg ->
+                msg.getPayload().getPayloadCase().equals(PayloadCase.PROPOSE_LAYOUT_REQUEST)).drop());
+        addServerRule(SERVERS.PORT_0, new TestRule().requestMatches(msg ->
+                msg.getPayload().getPayloadCase().equals(PayloadCase.COMMIT_LAYOUT_REQUEST)).drop());
+        addServerRule(SERVERS.PORT_0, new TestRule().requestMatches(msg ->
+                msg.getPayload().getPayloadCase().equals(PayloadCase.BOOTSTRAP_SEQUENCER_REQUEST)).drop());
+
+        // Block PORT_1 from receiving COMMIT_LAYOUT.
+        addServerRule(SERVERS.PORT_1, new TestRule().requestMatches(msg ->
+                msg.getPayload().getPayloadCase().equals(PayloadCase.COMMIT_LAYOUT_REQUEST)).drop());
+
+        // Induce a failure on PORT_2.
+        addServerRule(SERVERS.PORT_2, new TestRule().requestMatches(msg ->
+                msg.getPayload().getPayloadCase().equals(PayloadCase.QUERY_NODE_REQUEST)).drop());
+
+        // Wait for a layout change.
+        waitForLayoutChange(l -> l.getEpoch() == startingEpoch + 1, getCorfuRuntime());
+
+        // Allow the failure detector to fail enough times and invalidate its layout.
+        Sleep.sleepUninterruptibly(Duration.ofSeconds(20));
+
+        // Allow failure detection and consensus to resume normally.
+        clearServerRules(SERVERS.PORT_0);
+        clearServerRules(SERVERS.PORT_1);
+        clearServerRules(SERVERS.PORT_2);
+
+        // Perform additional reads and writes - These should not timeout.
+        for (int i = numWrites; i < 2*numWrites; i++) {
+            getCorfuRuntime().getObjectsView().TXBegin();
+            testTable.insert(Integer.toString(i), Integer.toString(i));
+            getCorfuRuntime().getObjectsView().TXEnd();
+        }
+
+        getCorfuRuntime().getObjectsView().TXBegin();
+        assertThat(testTable.size()).isEqualTo(2*numWrites);
+        getCorfuRuntime().getObjectsView().TXEnd();
     }
 }

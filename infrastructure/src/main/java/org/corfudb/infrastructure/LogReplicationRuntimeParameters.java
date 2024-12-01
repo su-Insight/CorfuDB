@@ -5,9 +5,8 @@ import io.netty.channel.EventLoopGroup;
 import lombok.Data;
 import org.corfudb.comm.ChannelImplementation;
 import org.corfudb.infrastructure.logreplication.LogReplicationConfig;
-import org.corfudb.infrastructure.logreplication.transport.IChannelContext;
-
 import org.corfudb.infrastructure.logreplication.infrastructure.ClusterDescriptor;
+import org.corfudb.infrastructure.logreplication.transport.IChannelContext;
 import org.corfudb.runtime.RuntimeParameters;
 import org.corfudb.runtime.RuntimeParametersBuilder;
 
@@ -43,6 +42,9 @@ public class LogReplicationRuntimeParameters extends RuntimeParameters {
     // Log Replication Channel Context
     private IChannelContext channelContext;
 
+    // Max write size(in bytes) for LR's runtime
+    private int maxWriteSize;
+
     public static LogReplicationRuntimeParametersBuilder builder() {
         return new LogReplicationRuntimeParametersBuilder();
     }
@@ -56,6 +58,7 @@ public class LogReplicationRuntimeParameters extends RuntimeParameters {
         private long topologyConfigId;
         private LogReplicationConfig replicationConfig;
         private IChannelContext channelContext;
+        private int maxWriteSize;
 
         private LogReplicationRuntimeParametersBuilder() {
         }
@@ -92,6 +95,11 @@ public class LogReplicationRuntimeParameters extends RuntimeParameters {
 
         public LogReplicationRuntimeParameters.LogReplicationRuntimeParametersBuilder channelContext(IChannelContext channelContext) {
             this.channelContext = channelContext;
+            return this;
+        }
+
+        public LogReplicationRuntimeParameters.LogReplicationRuntimeParametersBuilder maxWriteSize(int maxWriteSize) {
+            this.maxWriteSize = maxWriteSize;
             return this;
         }
 
@@ -222,6 +230,7 @@ public class LogReplicationRuntimeParameters extends RuntimeParameters {
             runtimeParameters.setKsPasswordFile(ksPasswordFile);
             runtimeParameters.setTrustStore(trustStore);
             runtimeParameters.setTsPasswordFile(tsPasswordFile);
+            runtimeParameters.setDisableCertExpiryCheckFile(disableCertExpiryCheckFile);
             runtimeParameters.setSaslPlainTextEnabled(saslPlainTextEnabled);
             runtimeParameters.setUsernameFile(usernameFile);
             runtimeParameters.setPasswordFile(passwordFile);
@@ -248,6 +257,7 @@ public class LogReplicationRuntimeParameters extends RuntimeParameters {
             runtimeParameters.setPluginFilePath(pluginFilePath);
             runtimeParameters.setChannelContext(channelContext);
             runtimeParameters.setReplicationConfig(replicationConfig);
+            runtimeParameters.setMaxWriteSize(maxWriteSize);
             return runtimeParameters;
         }
     }

@@ -6,6 +6,7 @@ import com.google.common.collect.Range;
 import com.google.common.io.Files;
 import lombok.Getter;
 import org.apache.commons.io.FileUtils;
+import org.corfudb.CorfuTestParameters;
 import org.corfudb.common.compression.Codec;
 import org.corfudb.infrastructure.AutoCommitService;
 import org.corfudb.infrastructure.ServerContext;
@@ -22,8 +23,8 @@ import org.corfudb.protocols.wireprotocol.TokenResponse;
 import org.corfudb.runtime.CorfuRuntime;
 import org.corfudb.runtime.clients.TestRule;
 import org.corfudb.runtime.exceptions.RetryExhaustedException;
-import org.corfudb.runtime.proto.service.CorfuMessage.RequestPayloadMsg.PayloadCase;
 import org.corfudb.runtime.proto.service.CorfuMessage.RequestPayloadMsg;
+import org.corfudb.runtime.proto.service.CorfuMessage.RequestPayloadMsg.PayloadCase;
 import org.corfudb.runtime.proto.service.CorfuMessage.ResponsePayloadMsg;
 import org.corfudb.runtime.view.ClusterStatusReport.ClusterStatus;
 import org.corfudb.runtime.view.ClusterStatusReport.ClusterStatusReliability;
@@ -51,6 +52,7 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import java.util.stream.LongStream;
 
@@ -60,13 +62,14 @@ import static org.corfudb.runtime.view.ClusterStatusReport.ClusterStatus.STABLE;
 import static org.corfudb.test.TestUtils.setAggressiveTimeouts;
 import static org.corfudb.test.TestUtils.waitForLayoutChange;
 
-/**
- * Created by zlokhandwala on 2019-06-06.
- */
 public class StateTransferTest extends AbstractViewTest {
 
     @Getter
     protected CorfuRuntime corfuRuntime = null;
+
+    public StateTransferTest() {
+        PARAMETERS = new CorfuTestParameters(Duration.ofMinutes(5));
+    }
 
     @Before
     public void clearRuntime() {
@@ -93,11 +96,11 @@ public class StateTransferTest extends AbstractViewTest {
     }
 
 
-    @Test
     /**
      * 1. Segment 1: 0 -> -1: Node 0, Node 1
      * 2. Add node Node 2
      */
+    @Test
     public void verifyAddNode() throws Exception {
         addServer(SERVERS.PORT_0);
         addServer(SERVERS.PORT_1);
@@ -162,12 +165,12 @@ public class StateTransferTest extends AbstractViewTest {
         assertThat(map_2.entrySet()).containsExactlyElementsOf(map_0.entrySet());
     }
 
-    @Test
     /**
      * 1. Segment 1: 0 -> 3: Node 0, Node 1
      * 2. Segment 2: 3 -> infinity: Node 0, Node 1, Node 2
      * 2. Node 2 eventually restores itself to the layout and merges segments
      */
+    @Test
     public void verifyRedundancyRestoration() throws Exception {
         addServer(SERVERS.PORT_0);
         addServer(SERVERS.PORT_1);
@@ -1275,11 +1278,9 @@ public class StateTransferTest extends AbstractViewTest {
             addServer(SERVERS.PORT_1, sc1);
             addServer(SERVERS.PORT_2, sc2);
 
-            // Add rule to drop all msgs except for service discovery ones
+            // Drop heal requests
             addServerRule(SERVERS.PORT_2, new TestRule().requestMatches(
-                    msg -> !msg.getPayload().getPayloadCase().equals(PayloadCase.BOOTSTRAP_LAYOUT_REQUEST)).drop());
-            addServerRule(SERVERS.PORT_2, new TestRule().requestMatches(
-                    msg -> !msg.getPayload().getPayloadCase().equals(PayloadCase.BOOTSTRAP_MANAGEMENT_REQUEST)).drop());
+                    msg -> msg.getPayload().getPayloadCase().equals(PayloadCase.HEAL_FAILURE_REQUEST)).drop());
 
             final long writtenAddressesBatch1 = 1500L;
             final long writtenAddressesBatch2 = 3000L;
@@ -1323,7 +1324,6 @@ public class StateTransferTest extends AbstractViewTest {
             setAggressiveTimeouts(l1, rt,
                     getManagementServer(SERVERS.PORT_0).getManagementAgent().getCorfuRuntime());
             setAggressiveDetectorTimeouts(SERVERS.PORT_0);
-
             // write a non-consolidated logs
             Set<Long> noWriteHoles = new HashSet<>(Arrays.asList(10L, 100L, 1000L, 2000L, 2500L, 2550L));
 
@@ -1335,13 +1335,18 @@ public class StateTransferTest extends AbstractViewTest {
 
             // Allow node 2 to be healed.
             clearServerRules(SERVERS.PORT_2);
+            Predicate<Layout> unhealthyServer2 = layout -> !layout.getUnresponsiveServers().isEmpty();
+            waitForLayoutChange(unhealthyServer2, rt);
 
             rt.invalidateLayout();
 
             // Wait until all the nodes are restored.
-            waitForLayoutChange(layout -> layout.getUnresponsiveServers().isEmpty() &&
-                            layout.segments.size() == 1,
-                    rt);
+            Predicate<Layout> expectedLayout = layout -> {
+                boolean healthyLayout = layout.getUnresponsiveServers().isEmpty();
+                boolean oneSegment = layout.segments.size() == 1;
+                return healthyLayout && oneSegment;
+            };
+            waitForLayoutChange(expectedLayout, rt);
 
             // Verify CT and data
             long committedTail = rt.getAddressSpaceView().getCommittedTail();

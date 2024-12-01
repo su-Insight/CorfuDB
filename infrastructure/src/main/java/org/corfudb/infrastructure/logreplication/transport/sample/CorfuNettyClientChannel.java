@@ -120,11 +120,11 @@ public class CorfuNettyClientChannel extends SimpleChannelInboundHandler<Respons
 
     private void setSslContext() {
          try {
-            sslContext = SslContextConstructor.constructSslContext(false,
-                    parameters.getKeyStore(),
-                    parameters.getKsPasswordFile(),
-                    parameters.getTrustStore(),
-                    parameters.getTsPasswordFile());
+            sslContext = SslContextConstructor.constructSslContext(
+                    false,
+                    parameters.getKeyStoreConfig(),
+                    parameters.getTrustStoreConfig()
+            );
         } catch (SSLException e) {
             throw new UnrecoverableCorfuError(e);
         }
@@ -140,7 +140,7 @@ public class CorfuNettyClientChannel extends SimpleChannelInboundHandler<Respons
      * Channel event that is triggered when a new connected channel is created.
      *
      * @param ctx channel handler context
-     * @throws Exception
+     * @throws Exception exception
      */
     @Override
     public void channelActive(ChannelHandlerContext ctx) {

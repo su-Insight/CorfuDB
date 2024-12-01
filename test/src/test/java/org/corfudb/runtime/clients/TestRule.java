@@ -1,11 +1,11 @@
 package org.corfudb.runtime.clients;
 
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.function.Function;
-
 import org.corfudb.infrastructure.IServerRouter;
 import org.corfudb.runtime.proto.service.CorfuMessage.RequestMsg;
 import org.corfudb.runtime.proto.service.CorfuMessage.ResponseMsg;
+
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
 
 /**
  * Created by mwei on 6/29/16.
@@ -95,6 +95,15 @@ public class TestRule {
             return false;
         }
 
+        return true;
+    }
+
+    public boolean evaluateRequest(RequestMsg msg, IServerRouter router) {
+        if (msg == null) {
+            return false;
+        } else if (match(msg) && drop) {
+            return false;
+        }
         return true;
     }
 

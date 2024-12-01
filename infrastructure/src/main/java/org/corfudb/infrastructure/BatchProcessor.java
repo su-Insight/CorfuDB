@@ -1,11 +1,16 @@
 package org.corfudb.infrastructure;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
 import com.google.protobuf.TextFormat;
-import io.micrometer.core.instrument.Timer;
+import lombok.Getter;
+import lombok.NonNull;
 import lombok.extern.slf4j.Slf4j;
 import org.corfudb.common.metrics.micrometer.MicroMeterUtils;
 import org.corfudb.infrastructure.BatchWriterOperation.Type;
+import org.corfudb.infrastructure.health.Component;
+import org.corfudb.infrastructure.health.HealthMonitor;
+import org.corfudb.infrastructure.health.Issue;
 import org.corfudb.infrastructure.log.StreamLog;
 import org.corfudb.protocols.CorfuProtocolLogData;
 import org.corfudb.protocols.wireprotocol.LogData;
@@ -14,19 +19,22 @@ import org.corfudb.protocols.wireprotocol.TailsResponse;
 import org.corfudb.runtime.exceptions.QuotaExceededException;
 import org.corfudb.runtime.exceptions.WrongEpochException;
 import org.corfudb.runtime.exceptions.unrecoverable.UnrecoverableCorfuInterruptedError;
+import org.corfudb.runtime.proto.FileSystemStats.BatchProcessorStatus;
 import org.corfudb.runtime.proto.service.CorfuMessage.RequestMsg;
 import org.corfudb.runtime.proto.service.CorfuMessage.RequestPayloadMsg;
+import org.corfudb.runtime.view.Layout;
 
 import javax.annotation.Nonnull;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Optional;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 
 import static org.corfudb.protocols.CorfuProtocolLogData.getLogData;
@@ -42,8 +50,10 @@ public class BatchProcessor implements AutoCloseable {
     private final int BATCH_SIZE;
     private final boolean sync;
     private final StreamLog streamLog;
-    private final BlockingQueue<BatchWriterOperation> operationsQueue;
+    private final BlockingQueue<BatchWriterOperation<?>> operationsQueue;
     private final ExecutorService processorService;
+
+    private final ExitManager exitManager;
 
     /**
      * The sealEpoch is the epoch up to which all operations have been sealed. Any
@@ -51,37 +61,46 @@ public class BatchProcessor implements AutoCloseable {
      * is completed exceptionally with a WrongEpochException.
      * This is persisted in the ServerContext by the LogUnitServer to withstand restarts.
      */
-    private long sealEpoch;
+    @Getter
+    private volatile long sealEpoch;
+
+    private final BatchProcessorContext context;
 
     /**
      * Returns a new BatchProcessor for a stream log.
      *
-     * @param streamLog stream log for writes (can be in memory or file)
+     * @param streamLog stream log for writes (can be in memory or file).
+     * @param context the underlying batch processor context.
+     * @param exitManager the exit manger to use when the main BP thread encounters an unrecoverable error.
      * @param sealEpoch All operations stamped with epoch less than the epochWaterMark are discarded.
-     * @param sync      If true, the batch writer will sync writes to secondary storage
+     * @param sync      If true, the batch writer will sync writes to secondary storage.
      */
-    public BatchProcessor(StreamLog streamLog, long sealEpoch, boolean sync) {
+    public BatchProcessor(@NonNull StreamLog streamLog, @NonNull BatchProcessorContext context,
+                          @NonNull ExitManager exitManager, long sealEpoch, boolean sync) {
         this.sealEpoch = sealEpoch;
         this.sync = sync;
         this.streamLog = streamLog;
+        this.context = context;
+        this.exitManager = exitManager;
 
         BATCH_SIZE = 50;
-        operationsQueue = new LinkedBlockingQueue<>();
-        processorService = Executors
-                .newSingleThreadExecutor(new ThreadFactoryBuilder()
-                        .setDaemon(false)
-                        .setNameFormat("LogUnit-BatchProcessor-%d")
-                        .build());
+        this.operationsQueue = new LinkedBlockingQueue<>();
 
+        processorService = newExecutorService();
         processorService.submit(this::process);
+
+        if (sealEpoch != Layout.INVALID_EPOCH) {
+            HealthMonitor.resolveIssue(Issue.createInitIssue(Component.LOG_UNIT));
+        }
     }
 
-    private void recordRunnable(Runnable runnable, Optional<Timer> timer) {
-        if (timer.isPresent()) {
-            timer.get().record(runnable);
-        } else {
-            runnable.run();
-        }
+    private ExecutorService newExecutorService() {
+        ThreadFactory threadFactory = new ThreadFactoryBuilder()
+                .setDaemon(false)
+                .setNameFormat("LogUnit-BatchProcessor-%d")
+                .build();
+
+        return Executors.newSingleThreadExecutor(threadFactory);
     }
 
     /**
@@ -149,7 +168,9 @@ public class BatchProcessor implements AutoCloseable {
                         (currentOp.getRequest().getPayload().getSealRequest().getEpoch() >= sealEpoch)) {
                     log.info("batchWriteProcessor: updating epoch from {} to {}",
                             sealEpoch, currentOp.getRequest().getPayload().getSealRequest().getEpoch());
-
+                    if (sealEpoch == Layout.INVALID_EPOCH) {
+                        HealthMonitor.resolveIssue(Issue.createInitIssue(Component.LOG_UNIT));
+                    }
                     sealEpoch = currentOp.getRequest().getPayload().getSealRequest().getEpoch();
                     res.add(currentOp);
                     lastOp = currentOp;
@@ -173,8 +194,12 @@ public class BatchProcessor implements AutoCloseable {
                                         "logunit.write.timer", "type", "single");
                                 break;
                             case RANGE_WRITE:
-                                List<LogData> range = payload.getRangeWriteLogRequest().getLogDataList()
-                                        .stream().map(CorfuProtocolLogData::getLogData).collect(Collectors.toList());
+                                List<LogData> range = payload.getRangeWriteLogRequest()
+                                        .getLogDataList()
+                                        .stream()
+                                        .map(CorfuProtocolLogData::getLogData)
+                                        .collect(Collectors.toList());
+
                                 MicroMeterUtils.time(() -> streamLog.append(range),
                                         "logunit.write.timer", "type", "range");
                                 break;
@@ -219,8 +244,11 @@ public class BatchProcessor implements AutoCloseable {
                     lastOp = currentOp;
                 }
             }
-        } catch (Exception e) {
-            log.error("Caught exception in the write processor ", e);
+        } catch (Throwable th) {
+            // Initiate a shutdown of the JVM when an unhandled Exception/Throwable is
+            // encountered, including IOExceptions during fsync and OutOfDirectMemoryErrors.
+            log.error("Encountered throwable in the write processor ", th);
+            exitManager.exit(CorfuServer.EXIT_ERROR_CODE);
         }
     }
 
@@ -233,6 +261,33 @@ public class BatchProcessor implements AutoCloseable {
                     TimeUnit.MILLISECONDS);
         } catch (InterruptedException e) {
             throw new UnrecoverableCorfuInterruptedError("BatchProcessor close interrupted.", e);
+        }
+    }
+
+    public static class BatchProcessorContext {
+        private final AtomicReference<BatchProcessorStatus> status = new AtomicReference<>(BatchProcessorStatus.BP_STATUS_OK);
+
+        @VisibleForTesting
+        public void setErrorStatus() {
+            status.set(BatchProcessorStatus.BP_STATUS_ERROR);
+        }
+
+        @VisibleForTesting
+        public void setOkStatus() {
+            status.set(BatchProcessorStatus.BP_STATUS_OK);
+        }
+
+        public BatchProcessorStatus getStatus() {
+            return status.get();
+        }
+    }
+
+    /**
+     * An exit manager to facilitate the injection of mocks during unit tests.
+     */
+    public static class ExitManager {
+        public void exit(int exitCode) {
+            System.exit(exitCode);
         }
     }
 }

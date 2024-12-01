@@ -8,12 +8,13 @@
 ### Current metrics collected for LR:
 
 *   **logreplication.message.size.bytes**: Message size in bytes (throughput, mean and max), distinguished by replication type (snapshot, logentry).
-*   **logreplication.lock.duration**: Duration of holding a leadership lock in seconds, distinguished by role (active, standby).
+*   **logreplication.lock.duration.nanoseconds**: Duration of holding a leadership lock in nanoseconds, distinguished by role (active, standby).
 *   **logreplication.lock.acquire.count**: Number of times a leadership lock was acquired, distinguised by role (active, standby).
-*   **logreplication.sender.duration.seconds**: Duration of sending a log entry in seconds (throughput, mean and max), distinguished by replication type (snapshot, logentry) and status (success, failure).
-*   **logreplication.rtt.seconds**: Duration of sending a message overall (throughput, mean and max).
+*   **logreplication.sender.duration.nanoseconds**: Duration of sending a log entry in nanoseconds (throughput, mean and max), distinguished by replication type (snapshot, logentry) and status (success, failure).
 *   **logreplication.snapshot.completed.count**: Number of snapshot syncs completed.
-*   **logreplication.snapshot.duration.seconds**: Duration of completing a snapshot sync in seconds (throughput, mean and max).
+*   **logreplication.snapshot.transfer.duration**: Duration of the TRANSFER phase of a snapshot sync in nanoseconds (throughput, mean and max).
+*   **logreplication.snapshot.apply.duration**: Duration of the APPLY phase of a snapshot sync in nanoseconds (throughput, mean and max).
+*   **logreplication.snapshot.duration**: Duration of completing a snapshot sync in nanoseconds (throughput, mean and max).
 *   **logreplication.acks**: Number of acks, distinguished by replication type (snapshot, logentry).
 *   **logreplication.messages**: Number of messages sent, distinguished by replication type (snapshot, logentry).
 *   **logreplication.opaque.count\_per\_message**: Number of opaque entries per message (rate, mean, max).
@@ -57,6 +58,10 @@
 *   **stream\_sub.queueDuration.timer**: Time in microseconds(mean, max, sum, 0.50p, 0.99p) it takes to wait in the queue.
 *   **corfu\_table.read.timer**: Time in microseconds(mean, max, sum, 0.50p, 0.99p) it takes to read from the corfu table's map.
 *   **corfu\_table.write.timer**: Time in microseconds(mean, max, sum, 0.50p, 0.99p) it takes to write to the corfu table's map.
+*   **logdata.decompress.timer**: Time in microseconds(mean, max, sum, 0.50p, 0.99p) it takes to decompress the payload.
+*   **logdata.compress.timer**: Time in microseconds(mean, max, sum, 0.50p, 0.99p) it takes to compress the payload.
+*   **logdata.compression.ratio**: A distribution summary (mean, max, 0.50p, 0.99p) of the payload's compression ratio.
+*   **logdata.decompressed.size**: A size estimate distribution (mean, max, 0.5p, 0.99p) of the decompressed payload.
 
 ### Current metrics collected for Corfu Server:
 

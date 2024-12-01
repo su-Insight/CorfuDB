@@ -1,9 +1,8 @@
 package org.corfudb.integration;
 
-import java.util.UUID;
 import org.corfudb.protocols.wireprotocol.Token;
 import org.corfudb.runtime.CorfuRuntime;
-import org.corfudb.runtime.collections.CorfuTable;
+import org.corfudb.runtime.collections.PersistentCorfuTable;
 import org.corfudb.runtime.view.Layout;
 import org.corfudb.runtime.view.stream.IStreamView;
 import org.junit.Ignore;
@@ -14,6 +13,7 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStreamReader;
 import java.util.Collections;
+import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -146,7 +146,7 @@ public class CmdletIT extends AbstractIT {
 
         corfuServerProcess = new CorfuServerRunner().setPort(PORT).runServer();
         final String streamA = "streamA";
-        runtime = createRuntime(ENDPOINT);
+        CorfuRuntime runtime = createRuntime(ENDPOINT);
         IStreamView streamViewA = runtime.getStreamsView().get(CorfuRuntime.getStreamID(streamA));
 
         String payload1 = "Hello";
@@ -176,7 +176,7 @@ public class CmdletIT extends AbstractIT {
 
         corfuServerProcess = new CorfuServerRunner().setPort(PORT).runServer();
         final String streamA = "streamA";
-        runtime = createRuntime(ENDPOINT);
+        CorfuRuntime runtime = createRuntime(ENDPOINT);
 
         String commandNextToken = CORFU_PROJECT_DIR + "bin/corfu_sequencer -i " + streamA + " -c " + ENDPOINT + " next-token 3";
         runCmdletGetOutput(commandNextToken);
@@ -270,7 +270,7 @@ public class CmdletIT extends AbstractIT {
 
         assertThat(runCmdletGetOutput(command).contains(expectedOutput)).isTrue();
 
-        runtime = createRuntime(ENDPOINT);
+        CorfuRuntime runtime = createRuntime(ENDPOINT);
         IStreamView streamViewA = runtime.getStreamsView().get(CorfuRuntime.getStreamID("streamA"));
         assertThat(streamViewA.hasNext())
                 .isFalse();
@@ -305,13 +305,13 @@ public class CmdletIT extends AbstractIT {
         final String commandPut = CORFU_PROJECT_DIR + "bin/corfu_smrobject" +
                 " -i " + streamA +
                 " -c " + ENDPOINT +
-                " " + CorfuTable.class.getCanonicalName() + " putIfAbsent x " + payload;
+                " " + PersistentCorfuTable.class.getCanonicalName() + " putIfAbsent x " + payload;
         runCmdletGetOutput(commandPut);
 
         final String commandGet = CORFU_PROJECT_DIR + "bin/corfu_smrobject" +
                 " -i " + streamA +
                 " -c " + ENDPOINT +
-                " " + CorfuTable.class.getCanonicalName() + " getOrDefault x none";
+                " " + PersistentCorfuTable.class.getCanonicalName() + " getOrDefault x none";
 
         assertThat(runCmdletGetOutput(commandGet).contains(payload)).isTrue();
 

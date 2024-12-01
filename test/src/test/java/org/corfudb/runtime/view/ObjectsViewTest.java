@@ -1,24 +1,24 @@
 package org.corfudb.runtime.view;
 
-import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import com.google.common.reflect.TypeToken;
-
-import java.util.List;
-import java.util.Map;
-import java.util.concurrent.Semaphore;
-
 import org.corfudb.protocols.logprotocol.LogEntry;
 import org.corfudb.protocols.logprotocol.MultiObjectSMREntry;
 import org.corfudb.protocols.logprotocol.MultiSMREntry;
 import org.corfudb.protocols.logprotocol.SMREntry;
 import org.corfudb.protocols.wireprotocol.ILogData;
 import org.corfudb.runtime.CorfuRuntime;
-import org.corfudb.runtime.collections.CorfuTable;
+import org.corfudb.runtime.collections.ICorfuTable;
+import org.corfudb.runtime.collections.PersistentCorfuTable;
 import org.corfudb.runtime.exceptions.TransactionAbortedException;
 import org.corfudb.runtime.view.stream.IStreamView;
 import org.corfudb.util.serializer.Serializers;
 import org.junit.Test;
+
+import java.util.List;
+import java.util.concurrent.Semaphore;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Created by mwei on 2/18/16.
@@ -26,7 +26,6 @@ import org.junit.Test;
 public class ObjectsViewTest extends AbstractViewTest {
 
     @Test
-    @SuppressWarnings("unchecked")
     public void canAbortNoTransaction()
             throws Exception {
         //begin tests
@@ -35,30 +34,30 @@ public class ObjectsViewTest extends AbstractViewTest {
     }
 
     @Test
-    @SuppressWarnings("unchecked")
     public void abortedTransactionDoesNotConflict()
             throws Exception {
         final String mapA = "map a";
         final String streamA = "streamA";
         CorfuRuntime r = getDefaultRuntime();
 
-        CorfuTable<String, String> map = getDefaultRuntime().getObjectsView()
+        ICorfuTable<String, String> map = getDefaultRuntime().getObjectsView()
                 .build()
                 .setStreamName(mapA)
                 .setStreamTags(CorfuRuntime.getStreamID(streamA))
-                .setTypeToken(new TypeToken<CorfuTable<String, String>>() {})
+                .setTypeToken(new TypeToken<PersistentCorfuTable<String, String>>() {})
                 .open();
 
         // TODO: fix so this does not require mapCopy.
-        CorfuTable<String, String> mapCopy = getDefaultRuntime().getObjectsView()
+        // Since we only allow one MVO for an object per runtime,
+        // NO_CACHE must not be used here. Instead, use another runtime.
+        ICorfuTable<String, String> mapCopy = getNewRuntime(getDefaultNode()).connect().getObjectsView()
                 .build()
                 .setStreamName(mapA)
                 .setStreamTags(CorfuRuntime.getStreamID(streamA))
-                .setTypeToken(new TypeToken<CorfuTable<String, String>>() {})
-                .option(ObjectOpenOption.NO_CACHE)
+                .setTypeToken(new TypeToken<PersistentCorfuTable<String, String>>() {})
                 .open();
 
-        map.put("initial", "value");
+        map.insert("initial", "value");
 
         Semaphore s1 = new Semaphore(0);
         Semaphore s2 = new Semaphore(0);
@@ -74,7 +73,7 @@ public class ObjectsViewTest extends AbstractViewTest {
                 map.get("k");
                 s1.release();   // Let thread 2 start.
                 s2.acquire();   // Wait for thread 2 to commit.
-                map.put("k", "v1");
+                map.insert("k", "v1");
                 getRuntime().getObjectsView().TXEnd();
             }).isInstanceOf(TransactionAbortedException.class);
         });
@@ -82,7 +81,7 @@ public class ObjectsViewTest extends AbstractViewTest {
         scheduleConcurrently(1, t -> {
             s1.acquire();   // Wait for thread 1 to read
             getRuntime().getObjectsView().TXBegin();
-            mapCopy.put("k", "v2");
+            mapCopy.insert("k", "v2");
             getRuntime().getObjectsView().TXEnd();
             s2.release();
         });
@@ -90,8 +89,7 @@ public class ObjectsViewTest extends AbstractViewTest {
         executeScheduled(2, PARAMETERS.TIMEOUT_LONG);
 
         // The result should contain T2s modification.
-        assertThat(map)
-                .containsEntry("k", "v2");
+        assertThat(map.get("k")).isEqualTo("v2");
 
         IStreamView taggedStream =
             r.getStreamsView().get(CorfuRuntime.getStreamID(streamA));
@@ -121,10 +119,10 @@ public class ObjectsViewTest extends AbstractViewTest {
         CorfuRuntime r2 = CorfuRuntime.fromParameters(CorfuRuntime.CorfuRuntimeParameters.builder()
                 .nettyEventLoop(NETTY_EVENT_LOOP)
                 .build());
-        CorfuTable<String, String> map = getDefaultRuntime().getObjectsView()
+        ICorfuTable<String, String> map = getDefaultRuntime().getObjectsView()
                 .build()
                 .setStreamName("mapa")
-                .setTypeToken(new TypeToken<CorfuTable<String, String>>() {})
+                .setTypeToken(new TypeToken<PersistentCorfuTable<String, String>>() {})
                 .open();
 
         r1.getObjectsView().TXBegin();
@@ -135,67 +133,62 @@ public class ObjectsViewTest extends AbstractViewTest {
     }
 
     @Test
-    @SuppressWarnings("unchecked")
     public void unrelatedStreamDoesNotConflict()
             throws Exception {
         //begin tests
         CorfuRuntime r = getDefaultRuntime();
 
-        Map<String, String> smrMap = r.getObjectsView().build()
+        ICorfuTable<String, String> smrMap = r.getObjectsView().build()
                 .setStreamName("map a")
-                .setTypeToken(new TypeToken<CorfuTable<String, String>>() {})
+                .setTypeToken(new TypeToken<PersistentCorfuTable<String, String>>() {})
                 .open();
 
         IStreamView streamB = r.getStreamsView().get(CorfuRuntime.getStreamID("b"));
-        smrMap.put("a", "b");
+        smrMap.insert("a", "b");
         streamB.append(new SMREntry("hi", new Object[]{"hello"}, Serializers.PRIMITIVE));
 
         //this TX should not conflict
-        assertThat(smrMap)
-                .doesNotContainKey("b");
+        assertThat(smrMap.containsKey("b")).isFalse();
+
         r.getObjectsView().TXBegin();
         String b = smrMap.get("a");
-        smrMap.put("b", b);
+        smrMap.insert("b", b);
         r.getObjectsView().TXEnd();
 
-        assertThat(smrMap)
-                .containsEntry("b", "b");
+        assertThat(smrMap.get("b")).isEqualTo("b");
     }
 
     @Test
-    @SuppressWarnings("unchecked")
     public void unrelatedTransactionDoesNotConflict()
             throws Exception {
         //begin tests
         CorfuRuntime r = getDefaultRuntime();
 
-        Map<String, String> smrMap = r.getObjectsView().build()
+        ICorfuTable<String, String> smrMap = r.getObjectsView().build()
                 .setStreamName("map a")
-                .setTypeToken(new TypeToken<CorfuTable<String, String>>() {})
+                .setTypeToken(new TypeToken<PersistentCorfuTable<String, String>>() {})
                 .open();
 
-        Map<String, String> smrMapB = r.getObjectsView().build()
+        ICorfuTable<String, String> smrMapB = r.getObjectsView().build()
                 .setStreamName("map b")
-                .setTypeToken(new TypeToken<CorfuTable<String, String>>() {})
+                .setTypeToken(new TypeToken<PersistentCorfuTable<String, String>>() {})
                 .open();
 
-        smrMap.put("a", "b");
+        smrMap.insert("a", "b");
 
         r.getObjectsView().TXBegin();
         String b = smrMap.get("a");
-        smrMapB.put("b", b);
+        smrMapB.insert("b", b);
         r.getObjectsView().TXEnd();
 
         //this TX should not conflict
-        assertThat(smrMap)
-                .doesNotContainKey("b");
+        assertThat(smrMap.containsKey("b")).isFalse();
         r.getObjectsView().TXBegin();
         b = smrMap.get("a");
-        smrMap.put("b", b);
+        smrMap.insert("b", b);
         r.getObjectsView().TXEnd();
 
-        assertThat(smrMap)
-                .containsEntry("b", "b");
+        assertThat(smrMap.get("b")).isEqualTo("b");
     }
 
 }

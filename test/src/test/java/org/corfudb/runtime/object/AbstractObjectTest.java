@@ -2,8 +2,8 @@ package org.corfudb.runtime.object;
 
 import com.google.common.reflect.TypeToken;
 import org.corfudb.runtime.CorfuRuntime;
+import org.corfudb.runtime.collections.PersistentCorfuTable;
 import org.corfudb.runtime.view.AbstractViewTest;
-import org.corfudb.util.serializer.ISerializer;
 
 /**
  * Created by dalia on 4/11/17.
@@ -25,12 +25,22 @@ public class AbstractObjectTest extends AbstractViewTest {
      */
     protected <T extends ICorfuSMR> T instantiateCorfuObject(
             CorfuRuntime r, Class<T> tClass, String name) {
-        return (T)
-                r.getObjectsView()
-                        .build()
-                        .setStreamName(name)     // stream name
-                        .setType(tClass)        // object class backed by this stream
-                        .open();                // instantiate the object!
+        if (tClass == PersistentCorfuTable.class) {
+            return (T)
+                    r.getObjectsView()
+                            .build()
+                            .setStreamName(name)     // stream name
+                            .setType(tClass)        // object class backed by this stream
+                            .open();                // instantiate the object!
+        }
+        else {
+            return (T)
+                    r.getObjectsView()
+                            .build()
+                            .setStreamName(name)     // stream name
+                            .setType(tClass)        // object class backed by this stream
+                            .open();                // instantiate the object!
+        }
     }
     protected <T extends ICorfuSMR> T instantiateCorfuObject(Class<T> tClass, String name) {
         return instantiateCorfuObject(getRuntime(), tClass, name);
@@ -52,24 +62,23 @@ public class AbstractObjectTest extends AbstractViewTest {
      */
     protected <T extends ICorfuSMR> Object instantiateCorfuObject(
             CorfuRuntime r, TypeToken<T> tType, String name) {
-        return r.getObjectsView()
-                        .build()
-                        .setStreamName(name)     // stream name
-                        .setTypeToken(tType)    // a TypeToken of the specified class
-                        .open();                // instantiate the object!
+        if (tType.getRawType() == PersistentCorfuTable.class) {
+            return r.getObjectsView()
+                    .build()
+                    .setStreamName(name)     // stream name
+                    .setTypeToken(tType)    // a TypeToken of the specified class
+                    .open();                // instantiate the object!
+        } else {
+            return r.getObjectsView()
+                    .build()
+                    .setStreamName(name)     // stream name
+                    .setTypeToken(tType)    // a TypeToken of the specified class
+                    .open();                // instantiate the object!
+        }
+
     }
     protected <T extends ICorfuSMR> Object instantiateCorfuObject(TypeToken<T> tType, String name) {
         return instantiateCorfuObject(getRuntime(), tType, name);
-    }
-
-    protected <T extends ICorfuSMR> Object instantiateCorfuObject(
-            CorfuRuntime r, TypeToken<T> tType, String name, ISerializer serializer) {
-        return r.getObjectsView()
-                        .build()
-                        .setStreamName(name)     // stream name
-                        .setTypeToken(tType)    // a TypeToken of the specified class
-                        .setSerializer(serializer)
-                        .open();                // instantiate the object!
     }
 
 }

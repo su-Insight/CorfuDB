@@ -9,7 +9,6 @@ import org.corfudb.infrastructure.logreplication.replication.fsm.LogReplicationE
 import org.corfudb.infrastructure.logreplication.replication.fsm.LogReplicationEvent.LogReplicationEventType;
 import org.corfudb.infrastructure.logreplication.replication.fsm.LogReplicationFSM;
 import org.corfudb.infrastructure.logreplication.replication.send.logreader.LogEntryReader;
-import org.corfudb.infrastructure.logreplication.replication.send.logreader.ReadProcessor;
 import org.corfudb.runtime.LogReplication.LogReplicationEntryMsg;
 import org.corfudb.runtime.exceptions.TrimmedException;
 
@@ -105,7 +104,7 @@ public class LogEntrySender {
 
                 if (message != null) {
                     if (MeterRegistryProvider.getInstance().isPresent()) {
-                        dataSenderBufferManager.sendWithBuffering(message, "logreplication.sender.duration.seconds",
+                        dataSenderBufferManager.sendWithBuffering(message, "logreplication.sender.duration.nanoseconds",
                                 Tag.of("replication.type", "logentry"));
                     } else {
                         dataSenderBufferManager.sendWithBuffering(message);

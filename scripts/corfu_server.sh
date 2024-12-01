@@ -25,14 +25,14 @@ else
 fi
 
 # Windows (cygwin) support
-case "`uname`" in
+case "$(uname)" in
     CYGWIN*) cygwin=true ;;
     *) cygwin=false ;;
 esac
 
 if $cygwin
 then
-    CLASSPATH=`cygpath -wp "$CLASSPATH"`
+    CLASSPATH=$(cygpath -wp "$CLASSPATH")
 fi
 
 if [ "$METRICS_CONFIG_FILE" != "" ]; then
@@ -40,8 +40,18 @@ if [ "$METRICS_CONFIG_FILE" != "" ]; then
   JAVA="$JAVA $LOGBACK_CONFIGURATION"
 fi
 
+
+#  Jacoco code coverage agent
+if [ "$CODE_COVERAGE" = true ]; then
+  MVN_PATH="$("${DIR}"/../mvnw help:evaluate -Dexpression=settings.localRepository -q -DforceStdout)"
+  JACOCO_VERSION=$("${DIR}"/../mvnw help:evaluate -Dexpression=jacoco.version -q -DforceStdout)
+  JACOCO_CMD="-javaagent:${MVN_PATH}/org/jacoco/org.jacoco.agent/${JACOCO_VERSION}/org.jacoco.agent-${JACOCO_VERSION}-runtime.jar=destfile=${DIR}/../infrastructure/target/jacoco-corfu-server.exec,append=true"
+  JAVA="$JAVA $JACOCO_CMD"
+fi
+
 # default heap for corfudb
+
 CORFUDB_HEAP="${CORFUDB_HEAP:-2000}"
-export JVMFLAGS="-Xmx${CORFUDB_HEAP}m $SERVER_JVMFLAGS"
+export JVMFLAGS="-XX:+UseG1GC -Xmx${CORFUDB_HEAP}m $SERVER_JVMFLAGS"
 
 $JAVA -cp "$CLASSPATH" $JVMFLAGS org.corfudb.infrastructure.CorfuServer $*

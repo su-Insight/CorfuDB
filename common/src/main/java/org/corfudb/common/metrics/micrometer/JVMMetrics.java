@@ -2,14 +2,14 @@ package org.corfudb.common.metrics.micrometer;
 
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.binder.jvm.JvmMemoryMetrics;
+import io.micrometer.core.instrument.binder.jvm.JvmThreadMetrics;
+import lombok.Getter;
+import lombok.Data;
+import io.netty.buffer.PooledByteBufAllocator;
+import io.netty.buffer.UnpooledByteBufAllocator;
 
 import java.util.Optional;
-import java.util.concurrent.TimeUnit;
-
-import lombok.Data;
-import lombok.Getter;
-import sun.management.HotspotRuntimeMBean;
-import sun.management.ManagementFactoryHelper;
 
 /**
  * Provides JVM level metrics.
@@ -17,8 +17,9 @@ import sun.management.ManagementFactoryHelper;
 
 public final class JVMMetrics {
 
-    @Getter(lazy = true)
-    private final static HotspotRuntimeMBean runtimeMBean = ManagementFactoryHelper.getHotspotRuntimeMBean();
+    @Getter(lazy=true)
+    private final static sun.management.HotspotRuntimeMBean runtimeMBean = sun.management
+            .ManagementFactoryHelper.getHotspotRuntimeMBean();
 
     @Data
     private static class SafePointStats {
@@ -26,28 +27,54 @@ public final class JVMMetrics {
         long safepointCount;
     }
 
+    public static void subscribeSafepointMetrics(MeterRegistry metricsRegistry) {
+
+        SafePointStats safePointStats = new SafePointStats();
+
+        Gauge.builder("jvm.safe_point_time", safePointStats, data -> {
+            long current = getRuntimeMBean().getTotalSafepointTime();
+            long delta = current - data.safepointTime;
+            data.safepointTime = current;
+            return delta;
+        }).strongReference(true).register(metricsRegistry);
+
+        Gauge.builder("jvm.safe_point_count", safePointStats, data -> {
+            long current = getRuntimeMBean().getSafepointCount();
+            long delta = current - data.safepointCount;
+            data.safepointCount = current;
+            return delta;
+        }).strongReference(true).register(metricsRegistry);
+    }
+
+    private static void subscribeThreadMetrics(MeterRegistry meterRegistry) {
+        JvmThreadMetrics threadMetrics = new JvmThreadMetrics();
+        threadMetrics.bindTo(meterRegistry);
+    }
+
+    private static void subscribeMemoryMetrics(MeterRegistry meterRegistry) {
+        JvmMemoryMetrics memoryMetrics = new JvmMemoryMetrics();
+        memoryMetrics.bindTo(meterRegistry);
+    }
+
+    private static void subscribeNettyMetrics() {
+        MicroMeterUtils.gauge("netty.usedHeapMemory", PooledByteBufAllocator.DEFAULT, pool ->
+                pool.metric().usedHeapMemory(), "allocator", "pooled");
+        MicroMeterUtils.gauge("netty.usedDirectMemory", PooledByteBufAllocator.DEFAULT, pool ->
+                pool.metric().usedDirectMemory(), "allocator", "pooled");
+        MicroMeterUtils.gauge("netty.usedHeapMemory", UnpooledByteBufAllocator.DEFAULT, pool ->
+                pool.metric().usedHeapMemory(), "allocator", "unpooled");
+        MicroMeterUtils.gauge("netty.usedDirectMemory", UnpooledByteBufAllocator.DEFAULT, pool ->
+                pool.metric().usedDirectMemory(), "allocator", "unpooled");
+    }
+
     public static void register(Optional<MeterRegistry> metricsRegistry) {
 
         if (metricsRegistry.isPresent()) {
-            SafePointStats safePointStats = new SafePointStats();
-
-            Gauge.builder("jvm.safe_point_time", safePointStats, data -> {
-                long current = getRuntimeMBean().getTotalSafepointTime();
-                long delta = current - data.safepointTime;
-                data.safepointTime = current;
-                return delta;
-            }).baseUnit(TimeUnit.MILLISECONDS.toString())
-                    .strongReference(true)
-                    .register(metricsRegistry.get());
-
-            Gauge.builder("jvm.safe_point_count", safePointStats, data -> {
-                long current = getRuntimeMBean().getSafepointCount();
-                long delta = current - data.safepointCount;
-                data.safepointCount = current;
-                return delta;
-            }).baseUnit(TimeUnit.MILLISECONDS.toString())
-                    .strongReference(true)
-                    .register(metricsRegistry.get());
+            final MeterRegistry meterRegistry = metricsRegistry.get();
+            subscribeMemoryMetrics(meterRegistry);
+            subscribeThreadMetrics(meterRegistry);
+            subscribeSafepointMetrics(meterRegistry);
+            subscribeNettyMetrics();
         }
     }
 }

@@ -297,7 +297,6 @@ public class DockerCorfuServer extends AbstractCorfuServer<CorfuServerParams, Un
         try {
             ListImagesParam corfuImageQuery = ListImagesParam
                     .byName(params.getDockerImageNameFullName());
-
             List<Image> corfuImages = docker.listImages(corfuImageQuery);
             if (corfuImages.isEmpty()) {
                 docker.pull(params.getDockerImageNameFullName());
@@ -345,8 +344,9 @@ public class DockerCorfuServer extends AbstractCorfuServer<CorfuServerParams, Un
         }
 
         HostConfig.Builder hostConfigBuilder = HostConfig.builder();
-        params.getContainerResources()
-                .ifPresent(limits -> hostConfigBuilder.memory(limits.getMemory()));
+        if (params.getContainerResources().getMemory().isPresent()) {
+            hostConfigBuilder.memory(params.getContainerResources().getMemory().get());
+        }
 
         HostConfig hostConfig = hostConfigBuilder
                 .privileged(true)

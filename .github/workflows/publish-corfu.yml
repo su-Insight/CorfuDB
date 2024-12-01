@@ -1,9 +1,14 @@
-name: CorfuDB Artifacts
+name: Publish CorfuDB Artifacts
 
 on:
   push:
     branches:
       - master
+
+# Cancel Previous Runs
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   publish_corfu_db_artifacts:
@@ -14,35 +19,44 @@ jobs:
     env:
       PKG_USERNAME: ${{ secrets.pkg_username }}
       PUBLISH_TOKEN: ${{ secrets.publish_token }}
-      DOCKER_USERNAME: ${{ secrets.docker_username }}
-      DOCKER_PASSWORD: ${{ secrets.docker_password }}
 
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
 
-      - name: Cancel Previous Runs
-        uses: styfle/cancel-workflow-action@0.6.0
+      - name: Set up JDK 11
+        uses: actions/setup-java@v4
         with:
-          access_token: ${{ github.token }}
+          distribution: 'corretto'
+          java-version: '11'
+          check-latest: true
+          cache-dependency-path: '**/pom.xml'
 
-      - name: Set up JDK
-        uses: actions/setup-java@v1
-        with:
-          java-version: 1.8
+      - name: Log in to Docker Hub
+        run: echo "${{ secrets.docker_password }}" | docker login -u "${{ secrets.docker_username }}" --password-stdin
 
       - name: Cache local Maven repository
-        uses: actions/cache@v2
+        uses: actions/cache@v3
         with:
-          path: ~/.m2
+          path: |
+            ~/.m2/repository
+            ~/.m2/wrapper/
           key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
           restore-keys: |
             ${{ runner.os }}-maven-
 
-      - uses: satackey/action-docker-layer-caching@v0.0.11
-        continue-on-error: true
+      - name: Install Docker
+        run: |
+          for pkg in docker.io docker-ce docker-ce-cli docker-ce-rootless-extras docker-doc docker-compose docker-compose-v2 podman-docker containerd runc; do sudo apt-get remove $pkg; done
+          curl -fsSL https://get.docker.com -o get-docker.sh
+          sudo sh ./get-docker.sh --version 24.0.9
+          /usr/bin/docker version
+          /usr/bin/docker info
 
       - name: Prepare Corfu
-        run: ./mvnw clean install -Pdocker -DskipTests -Dmaven.javadoc.skip=true -Dcheckstyle.skip -T 1C
+        run: |
+          .ci/infrastructure-docker-build.sh docker
+          .ci/generator-docker-build.sh
+        shell: bash
 
       - name: Publish corfu artifacts
         working-directory: ./

@@ -2,7 +2,7 @@ package org.corfudb.runtime.object.transactions;
 
 import lombok.extern.slf4j.Slf4j;
 import org.corfudb.runtime.exceptions.TransactionAbortedException;
-import org.corfudb.runtime.object.ICorfuSMRProxyInternal;
+import org.corfudb.runtime.object.MVOCorfuCompileProxy;
 
 /** A write-after-write transactional context.
  *
@@ -30,20 +30,19 @@ public class WriteAfterWriteTransactionalContext
 
     @Override
     public long commitTransaction() throws TransactionAbortedException {
-        log.debug("TX[{}] request write-write commit", this);
-
+        log.trace("TX[{}] request write-write commit", this);
         return getConflictSetAndCommit(getWriteSetInfo());
     }
 
     @Override
-    /** Add the proxy and conflict-params information to our read set.
+    /*
+     * Add the proxy and conflict-params information to our read set.
      * @param proxy             The proxy to add
      * @param conflictObjects    The fine-grained conflict information, if
      *                          available.
      */
-    public void addToReadSet(ICorfuSMRProxyInternal proxy, Object[] conflictObjects) {
-        // CorfuStore.txn() maps any TX to write-write TX, keep track of read-set to
-        // resolve valid snapshot across all accessed streams.
-        getReadSetInfo().add(proxy, conflictObjects);
+    public void addToReadSet(MVOCorfuCompileProxy proxy, Object[] conflictObjects) {
+        // no-op: since WRITE_AFTER_WRITE transaction type only need to detect write-write conflicts there
+        // is no need to track the the read set
     }
 }

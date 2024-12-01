@@ -1,28 +1,28 @@
 package org.corfudb.runtime.collections;
 
-import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
-
-
 import com.google.common.primitives.UnsignedBytes;
-import java.util.Comparator;
-import java.util.List;
-import java.util.Map;
-import java.util.TreeMap;
-import lombok.Getter;
-import lombok.extern.slf4j.Slf4j;
-import org.corfudb.runtime.CorfuRuntime;
 import com.google.common.reflect.TypeToken;
 import com.google.protobuf.ByteString;
-import java.util.Set;
-import java.util.stream.Collectors;
-import java.util.stream.IntStream;
+import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
 import org.corfudb.protocols.wireprotocol.Token;
+import org.corfudb.runtime.CorfuRuntime;
 import org.corfudb.runtime.MultiCheckpointWriter;
 import org.corfudb.runtime.collections.CorfuQueue.CorfuQueueRecord;
 import org.corfudb.runtime.view.AbstractViewTest;
 import org.corfudb.util.serializer.Serializers;
 import org.junit.Test;
+
+import java.util.Comparator;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Created by Sundar Sridharan on May 22, 2019
@@ -39,9 +39,16 @@ public class CorfuQueueTest extends AbstractViewTest {
         return ByteString.copyFromUtf8(string);
     }
 
+    private CorfuRuntime createDefaultRuntime() {
+        final int MVO_CACHE_SIZE = 100;
+        final CorfuRuntime runtime = getDefaultRuntime();
+        runtime.getParameters().setMaxMvoCacheEntries(MVO_CACHE_SIZE);
+        return runtime;
+    }
+
     @Test
     public void failNonTxnEnqueue() {
-        CorfuQueue corfuQueue = new CorfuQueue(getDefaultRuntime(), "test");
+        CorfuQueue corfuQueue = new CorfuQueue(createDefaultRuntime(), "test");
         assertThatThrownBy(() -> corfuQueue.enqueue(getByteString("c")))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessage("must be called within a transaction!");
@@ -54,13 +61,13 @@ public class CorfuQueueTest extends AbstractViewTest {
     }
 
     @Test
-    @SuppressWarnings("unchecked")
     public void basicQueueOrder() {
-        CorfuQueue corfuQueue = new CorfuQueue(getDefaultRuntime(), "test");
+        CorfuRuntime runtime = createDefaultRuntime();
+        CorfuQueue corfuQueue = new CorfuQueue(runtime, "test");
 
-        executeTxn(getDefaultRuntime(), () -> corfuQueue.enqueue(getByteString("c")));
-        executeTxn(getDefaultRuntime(), () -> corfuQueue.enqueue(getByteString("b")));
-        executeTxn(getDefaultRuntime(), () -> corfuQueue.enqueue(getByteString("a")));
+        executeTxn(runtime, () -> corfuQueue.enqueue(getByteString("c")));
+        executeTxn(runtime, () -> corfuQueue.enqueue(getByteString("b")));
+        executeTxn(runtime, () -> corfuQueue.enqueue(getByteString("a")));
 
         List<CorfuQueueRecord> records = corfuQueue.entryList();
 
@@ -90,11 +97,12 @@ public class CorfuQueueTest extends AbstractViewTest {
 
     @Test
     public void queueWithSecondaryIndexCheck() {
-        CorfuQueue corfuQueue = new CorfuQueue(getDefaultRuntime(), "test");
+        CorfuRuntime runtime = createDefaultRuntime();
+        CorfuQueue corfuQueue = new CorfuQueue(runtime, "test");
 
-        executeTxn(getDefaultRuntime(), () -> corfuQueue.enqueue(getByteString("c")));
-        executeTxn(getDefaultRuntime(), () -> corfuQueue.enqueue(getByteString("b")));
-        executeTxn(getDefaultRuntime(), () -> corfuQueue.enqueue(getByteString("a")));
+        executeTxn(runtime, () -> corfuQueue.enqueue(getByteString("c")));
+        executeTxn(runtime, () -> corfuQueue.enqueue(getByteString("b")));
+        executeTxn(runtime, () -> corfuQueue.enqueue(getByteString("a")));
 
         final int expected = 3;
         List<CorfuQueueRecord> records = corfuQueue.entryList();
@@ -137,18 +145,17 @@ public class CorfuQueueTest extends AbstractViewTest {
 
     @Test
     public void queueBackwardsCompatibility() {
-        CorfuQueue oldQueueInstance1 = new CorfuQueue(getDefaultRuntime(), "test",
-                Serializers.JSON);
+        CorfuRuntime runtime = createDefaultRuntime();
+        CorfuQueue oldQueueInstance1 = new CorfuQueue(runtime, "test", Serializers.JSON);
 
         CorfuRuntime rt2 = getNewRuntime(getDefaultNode()).connect();
-        CorfuQueue oldQueueInstance2 = new CorfuQueue(rt2, "test",
-                Serializers.QUEUE_SERIALIZER);
+        CorfuQueue oldQueueInstance2 = new CorfuQueue(rt2, "test", Serializers.QUEUE_SERIALIZER);
 
         // produce items to the queue with two different serializers from two different clients
         final int numItemsToProduce = 10;
         IntStream.range(0, numItemsToProduce).forEach(itemIdx -> {
             if (itemIdx % 2 == 0) {
-                executeTxn(getDefaultRuntime(),
+                executeTxn(runtime,
                         () -> oldQueueInstance1.enqueue(getByteString(String.valueOf(itemIdx))));
             } else {
                 executeTxn(rt2,
@@ -171,21 +178,21 @@ public class CorfuQueueTest extends AbstractViewTest {
 
     @Test
     public void queueMapCompatibility() {
+        CorfuRuntime runtime = createDefaultRuntime();
 
         // Produce some items to the corfu queue
-        CorfuQueue queue = new CorfuQueue(getDefaultRuntime(), "test");
+        CorfuQueue queue = new CorfuQueue(runtime, "test");
         final int numItemsToProduce = 10;
         IntStream.range(0, numItemsToProduce).forEach(itemIdx -> {
-            executeTxn(getDefaultRuntime(),
-                    () -> queue.enqueue(getByteString(String.valueOf(itemIdx))));
+            executeTxn(runtime, () -> queue.enqueue(getByteString(String.valueOf(itemIdx))));
         });
 
         // Verify that the queue can be opened as a map object
         CorfuRuntime rt2 = getNewRuntime(getDefaultNode()).connect();
-        CorfuTable<CorfuQueue.CorfuRecordId, ByteString> map = rt2.getObjectsView()
+        PersistentCorfuTable<CorfuQueue.CorfuRecordId, ByteString> map = rt2.getObjectsView()
                 .build()
                 .setStreamName("test")
-                .setTypeToken(new TypeToken<CorfuTable<CorfuQueue.CorfuRecordId, ByteString>>() {})
+                .setTypeToken(new TypeToken<PersistentCorfuTable<CorfuQueue.CorfuRecordId, ByteString>>() {})
                 .setSerializer(Serializers.QUEUE_SERIALIZER)
                 .open();
 
@@ -204,19 +211,16 @@ public class CorfuQueueTest extends AbstractViewTest {
 
     @Test
     public void queueCheckpointTest() {
+        CorfuRuntime runtime = createDefaultRuntime();
 
         // Produce to two different queues using the old and new serializer
-        CorfuQueue queueInstance1 = new CorfuQueue(getDefaultRuntime(), "stream1",
-                Serializers.JSON);
-
-        CorfuQueue queueInstance2 = new CorfuQueue(getDefaultRuntime(), "stream2");
+        CorfuQueue queueInstance1 = new CorfuQueue(runtime, "stream1", Serializers.JSON);
+        CorfuQueue queueInstance2 = new CorfuQueue(runtime, "stream2");
 
         final int numItemsToProduce = 10;
         IntStream.range(0, numItemsToProduce).forEach(itemIdx -> {
-            executeTxn(getDefaultRuntime(),
-                    () -> queueInstance1.enqueue(getByteString(String.valueOf(itemIdx))));
-            executeTxn(getDefaultRuntime(),
-                    () -> queueInstance2.enqueue(getByteString(String.valueOf(itemIdx))));
+            executeTxn(runtime, () -> queueInstance1.enqueue(getByteString(String.valueOf(itemIdx))));
+            executeTxn(runtime, () -> queueInstance2.enqueue(getByteString(String.valueOf(itemIdx))));
         });
 
         // Checkpoint the queues
@@ -225,23 +229,23 @@ public class CorfuQueueTest extends AbstractViewTest {
                 .setCacheDisabled(true)
                 .connect();
 
-        CorfuTable<CorfuQueue.CorfuRecordId, ByteString> map1 = checkpointerRuntime
+        PersistentCorfuTable<CorfuQueue.CorfuRecordId, ByteString> map1 = checkpointerRuntime
                 .getObjectsView()
                 .build()
                 .setStreamName("stream1")
-                .setTypeToken(new TypeToken<CorfuTable<CorfuQueue.CorfuRecordId, ByteString>>() {})
+                .setTypeToken(new TypeToken<PersistentCorfuTable<CorfuQueue.CorfuRecordId, ByteString>>() {})
                 .setSerializer(Serializers.QUEUE_SERIALIZER)
                 .open();
 
-        CorfuTable<CorfuQueue.CorfuRecordId, ByteString> map2 = checkpointerRuntime
+        PersistentCorfuTable<CorfuQueue.CorfuRecordId, ByteString> map2 = checkpointerRuntime
                 .getObjectsView()
                 .build()
                 .setStreamName("stream2")
-                .setTypeToken(new TypeToken<CorfuTable<CorfuQueue.CorfuRecordId, ByteString>>() {})
+                .setTypeToken(new TypeToken<PersistentCorfuTable<CorfuQueue.CorfuRecordId, ByteString>>() {})
                 .setSerializer(Serializers.QUEUE_SERIALIZER)
                 .open();
 
-        MultiCheckpointWriter mcw = new MultiCheckpointWriter();
+        MultiCheckpointWriter<PersistentCorfuTable<CorfuQueue.CorfuRecordId, ByteString>> mcw = new MultiCheckpointWriter<>();
         mcw.addMap(map1);
         mcw.addMap(map2);
         Token checkpointAddress = mcw.appendCheckpoints(getRuntime(), "author");

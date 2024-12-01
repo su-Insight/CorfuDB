@@ -4,6 +4,7 @@ import lombok.Getter;
 import lombok.NonNull;
 import lombok.extern.slf4j.Slf4j;
 import org.corfudb.common.util.ClassUtils;
+import org.corfudb.infrastructure.ServerContext;
 import org.corfudb.universe.group.Group;
 import org.corfudb.universe.group.Group.GroupParams;
 import org.corfudb.universe.node.Node;
@@ -14,7 +15,6 @@ import org.corfudb.universe.universe.UniverseParams;
 import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 
 @Slf4j
 public abstract class AbstractCluster<
@@ -35,7 +35,7 @@ public abstract class AbstractCluster<
     protected AbstractCluster(P params, U universeParams) {
         this.params = params;
         this.universeParams = universeParams;
-        this.executor = Executors.newCachedThreadPool();
+        this.executor = ServerContext.getCachedExecutorService("abstract-cluster");
     }
 
     protected CompletableFuture<Node> deployAsync(Node server) {
@@ -87,6 +87,8 @@ public abstract class AbstractCluster<
                 log.warn("Can't destroy node: {} in group: {}", node.getParams().getName(), getParams().getName(), e);
             }
         });
+
+        executor.shutdownNow();
     }
 
     @Override

@@ -34,7 +34,6 @@ import java.util.UUID;
 import java.util.stream.Stream;
 
 import static com.google.protobuf.UnsafeByteOperations.unsafeWrap;
-import static org.corfudb.infrastructure.logreplication.LogReplicationConfig.MAX_DATA_MSG_SIZE_SUPPORTED;
 import static org.corfudb.protocols.CorfuProtocolCommon.getUuidMsg;
 import static org.corfudb.protocols.service.CorfuProtocolLogReplication.generatePayload;
 import static org.corfudb.protocols.service.CorfuProtocolLogReplication.getLrEntryMsg;
@@ -43,6 +42,8 @@ import static org.corfudb.protocols.service.CorfuProtocolLogReplication.getLrEnt
 @NotThreadSafe
 /**
  *  Default snapshot reader implementation
+ *
+ *  The streams to replicate are read from registry table and will be refreshed at the start of a snapshot sync.
  *
  *  This implementation provides reads at the stream level (no coalesced state).
  *  It generates TxMessages which will be transmitted by the DataSender (provided by the application).
@@ -53,11 +54,17 @@ public class StreamsSnapshotReader implements SnapshotReader {
      * The max size of data for SMR entries in data message.
      */
     private final int maxDataSizePerMsg;
+
+    /**
+     * The max total size of the message.
+     */
+    private final int maxMsgSize;
     private final Optional<DistributionSummary> messageSizeDistributionSummary;
+    private final CorfuRuntime rt;
+    private final LogReplicationConfig config;
     private long snapshotTimestamp;
     private Set<String> streams;
     private PriorityQueue<String> streamsToSend;
-    private CorfuRuntime rt;
     private long preMsgTs;
     private long currentMsgTs;
     private OpaqueStreamIterator currentStreamInfo;
@@ -75,8 +82,10 @@ public class StreamsSnapshotReader implements SnapshotReader {
      */
     public StreamsSnapshotReader(CorfuRuntime runtime, LogReplicationConfig config) {
         this.rt = runtime;
+        this.config = config;
         this.rt.parseConfigurationString(runtime.getLayoutServers().get(0)).connect();
         this.maxDataSizePerMsg = config.getMaxDataSizePerMsg();
+        this.maxMsgSize = config.getMaxMsgSize();
         this.streams = config.getStreamsToReplicate();
         this.messageSizeDistributionSummary = configureMessageSizeDistributionSummary();
     }
@@ -147,9 +156,9 @@ public class StreamsSnapshotReader implements SnapshotReader {
                     if (smrEntries != null) {
                         int currentEntrySize = ReaderUtility.calculateSize(smrEntries);
 
-                        if (currentEntrySize > MAX_DATA_MSG_SIZE_SUPPORTED) {
-                            log.error("The current entry size {} is bigger than the maxDataSizePerMsg {} supported",
-                                    currentEntrySize, MAX_DATA_MSG_SIZE_SUPPORTED);
+                        if (currentEntrySize > maxMsgSize) {
+                            log.error("The current entry size {} is bigger than the maxMsgSize {} supported",
+                                    currentEntrySize, maxMsgSize);
                             throw new IllegalSnapshotEntrySizeException(" The snapshot entry is bigger than the system supported");
                         } else if (currentEntrySize > maxDataSizePerMsg) {
                             observeBiggerMsg.setValue(observeBiggerMsg.getValue()+1);
@@ -264,6 +273,10 @@ public class StreamsSnapshotReader implements SnapshotReader {
 
     @Override
     public void reset(long ts) {
+        // As the config should reflect the latest configuration read from registry table, it will be synced with the
+        // latest registry table content instead of the given ts, while the streams to replicate will be read up to ts.
+        config.syncWithRegistry();
+        streams = config.getStreamsToReplicate();
         streamsToSend = new PriorityQueue<>(streams);
         preMsgTs = Address.NON_ADDRESS;
         currentMsgTs = Address.NON_ADDRESS;

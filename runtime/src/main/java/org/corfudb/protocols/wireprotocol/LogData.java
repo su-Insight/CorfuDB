@@ -18,6 +18,7 @@ import org.corfudb.util.serializer.Serializers;
 
 import java.nio.ByteBuffer;
 import java.util.EnumMap;
+import java.util.Objects;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 
@@ -106,7 +107,7 @@ public class LogData implements IMetadata, ILogData {
                             Supplier<ByteBuf> bufSupplier = () -> Unpooled.wrappedBuffer(getPayloadCodecType()
                                     .getInstance().decompress(ByteBuffer.wrap(compressedArrayBuf)));
                             serializedBuf = MicroMeterUtils.time(bufSupplier,
-                                    "logdata.decompress");
+                                    "logdata.decompress.timer");
                         }
 
                         final Object actualValue;
@@ -343,7 +344,7 @@ public class LogData implements IMetadata, ILogData {
     private void doCompressInternal(ByteBuf bufData, ByteBuf buf) {
         ByteBuffer wrappedByteBuf = ByteBuffer.wrap(bufData.array(), 0, bufData.readableBytes());
         Supplier<ByteBuffer> compressSupplier = () -> getPayloadCodecType().getInstance().compress(wrappedByteBuf);
-        ByteBuffer compressedBuf = MicroMeterUtils.time(compressSupplier, "logdata.compress");
+        ByteBuffer compressedBuf = MicroMeterUtils.time(compressSupplier, "logdata.compress.timer");
         CorfuProtocolCommon.serialize(buf, Unpooled.wrappedBuffer(compressedBuf));
     }
 
@@ -353,23 +354,27 @@ public class LogData implements IMetadata, ILogData {
      */
     @Override
     public boolean equals(Object o) {
-        if (o == this) {
-            return true;
-        } else if (!(o instanceof LogData)) {
-            return false;
-        } else {
-            LogData other = (LogData) o;
-            if (compareTo(other) == 0) {
-                boolean sameClientId = getClientId() == null ? other.getClientId() == null :
-                        getClientId().equals(other.getClientId());
-                boolean sameThreadId = getThreadId() == null ? other.getThreadId() == null :
-                        getThreadId().equals(other.getThreadId());
-
-                return sameClientId && sameThreadId;
-            }
-
+        if (o == null) {
             return false;
         }
+
+        if (o == this) {
+            return true;
+        }
+
+        if (!(o instanceof LogData)) {
+            return false;
+        }
+
+        LogData other = (LogData) o;
+        if (compareTo(other) != 0) {
+            return false;
+        }
+
+        boolean sameClientId = Objects.equals(getClientId(), other.getClientId());
+        boolean sameThreadId = Objects.equals(getThreadId(), other.getThreadId());
+
+        return sameClientId && sameThreadId;
     }
 
     @Override

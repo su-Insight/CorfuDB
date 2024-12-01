@@ -3,36 +3,35 @@ package org.corfudb.runtime;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 import org.corfudb.protocols.wireprotocol.Token;
-import org.corfudb.runtime.collections.StreamingMap;
+import org.corfudb.runtime.collections.ICorfuTable;
 import org.corfudb.runtime.exceptions.WrongEpochException;
-import org.corfudb.runtime.object.CorfuCompileProxy;
 import org.corfudb.runtime.object.ICorfuSMR;
 import org.corfudb.util.serializer.ISerializer;
 
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 
 /**
  * Checkpoint multiple CorfuTables serially as a prerequisite for a later log trim.
  */
 @Slf4j
-public class MultiCheckpointWriter<T extends StreamingMap> {
+public class MultiCheckpointWriter<T extends ICorfuTable<?, ?>> {
     @Getter
-    private List<ICorfuSMR<T>> maps = new ArrayList<>();
+    private List<ICorfuSMR> tables = new ArrayList<>();
 
-    /** Add a map to the list of maps to be checkpointed by this class. */
-    @SuppressWarnings("unchecked")
-    public void addMap(T map) {
-        maps.add((ICorfuSMR<T>) map);
+    /** Add a table to the list of tables to be checkpointed by this class. */
+    public void addMap(T table) {
+        this.tables.add((ICorfuSMR) table);
     }
 
-    /** Add map(s) to the list of maps to be checkpointed by this class. */
+    /** Add table(s) to the list of tables to be checkpointed by this class. */
 
-    public void addAllMaps(Collection<T> maps) {
-        for (T map : maps) {
-            addMap(map);
+    public void addAllMaps(Collection<T> tables) {
+        for (T table : tables) {
+            addMap(table);
         }
     }
 
@@ -43,31 +42,28 @@ public class MultiCheckpointWriter<T extends StreamingMap> {
      * @param author Author's name, stored in checkpoint metadata
      * @return Global log address of the first record of
      */
-    public Token appendCheckpoints(CorfuRuntime rt, String author) {
+    public Token appendCheckpoints(CorfuRuntime rt, String author, Optional<LivenessUpdater> livenessUpdater) {
         int numRetries = rt.getParameters().getCheckpointRetries();
         int retry = 0;
-        log.info("appendCheckpoints: appending checkpoints for {} maps", maps.size());
 
         Token minSnapshot = Token.UNINITIALIZED;
 
-        final long cpStart = System.currentTimeMillis();
         try {
-            for (ICorfuSMR<T> map : maps) {
-                UUID streamId = map.getCorfuStreamID();
+            for (ICorfuSMR table : tables) {
+                UUID streamId = table.getCorfuSMRProxy().getStreamID();
 
-                CheckpointWriter<T> cpw = new CheckpointWriter(rt, streamId, author, (T) map);
-                ISerializer serializer = ((CorfuCompileProxy) map.getCorfuSMRProxy())
-                                .getSerializer();
+                CheckpointWriter<T> cpw = new CheckpointWriter<>(rt, streamId, author, (T) table);
+                ISerializer serializer = table.getCorfuSMRProxy().getSerializer();
                 cpw.setSerializer(serializer);
 
                 Token minCPSnapshot = Token.UNINITIALIZED;
                 while (retry < numRetries) {
                     try {
-                        minCPSnapshot = cpw.appendCheckpoint();
+                        minCPSnapshot = cpw.appendCheckpoint(livenessUpdater);
                         break;
                     } catch (WrongEpochException wee) {
                         log.info("Epoch changed to {} during append checkpoint snapshot resolution. Sequencer" +
-                                " failover can lead to potential epoch regression, retry {}/{}", wee.getCorrectEpoch(),
+                                        " failover can lead to potential epoch regression, retry {}/{}", wee.getCorrectEpoch(),
                                 retry, numRetries);
                         retry++;
                         if (retry == numRetries) {
@@ -92,13 +88,13 @@ public class MultiCheckpointWriter<T extends StreamingMap> {
             // TODO(Maithem): print cp id?
             log.trace("appendCheckpoints: finished, author '{}' at min globalAddress {}",
                     author, minSnapshot);
-            rt.getObjectsView().TXEnd();
         }
-        final long cpStop = System.currentTimeMillis();
 
-        log.info("appendCheckpoints: took {} ms to append {} checkpoints", cpStop - cpStart,
-                maps.size());
         return minSnapshot;
+    }
+
+    public Token appendCheckpoints(CorfuRuntime rt, String author) {
+        return appendCheckpoints(rt, author, Optional.empty());
     }
 
 }

@@ -2,13 +2,12 @@ package org.corfudb.runtime.clients;
 
 import org.corfudb.protocols.service.CorfuProtocolMessage.ClusterIdCheck;
 import org.corfudb.protocols.service.CorfuProtocolMessage.EpochCheck;
-import java.util.concurrent.CompletableFuture;
-
 import org.corfudb.runtime.proto.RpcCommon.UuidMsg;
 import org.corfudb.runtime.proto.service.CorfuMessage;
 import org.corfudb.runtime.proto.service.CorfuMessage.RequestPayloadMsg;
 
 import javax.annotation.Nonnull;
+import java.util.concurrent.CompletableFuture;
 
 /**
  * This is an interface in which all client routers must implement.
@@ -93,6 +92,11 @@ public interface IClientRouter {
     void stop();
 
     /**
+     * Reestablish the connection.
+     */
+    void reconnect();
+
+    /**
      * The host that this router is routing requests for.
      */
     String getHost();
@@ -122,4 +126,16 @@ public interface IClientRouter {
      * @param timeoutResponse Response timeout in milliseconds.
      */
     void setTimeoutResponse(long timeoutResponse);
+
+    /**
+     * Get the Connection timeout
+     * @return connection timeout
+     */
+    long getTimeoutConnect();
+
+    /**
+     * Get the Response timeout
+     * @return response timeout
+     */
+    long getTimeoutResponse();
 }
